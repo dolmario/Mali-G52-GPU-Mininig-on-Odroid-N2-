@@ -147,7 +147,7 @@ int main(int argc, char **argv) {
     
     // Modern queue creation (robuster)
     const cl_queue_properties props[] = { CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0 };
-    cl_command_queue queue = clCreateCommandQueueWithProperties(ctx, device, props, &err);
+    cl_command_queue queue = clCreateCommandQueue(ctx, device, 0, &err);
     if (!queue || err) {
         fprintf(stderr, "clCreateCommandQueue failed: %d\n", err);
         return 1;
