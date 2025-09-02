@@ -198,7 +198,10 @@ int main(int argc, char **argv) {
     uint32_t blocks_per_lane = m_cost_kb;  // 1 block = 1 KiB
     
     // Chunking parameters (kritisch für Watchdog!)
-    uint32_t chunks_per_pass = (m_cost_kb <= 32 * 1024) ? 16 : 32;  // Mehr chunks bei größerem Memory
+    uint32_t chunks_per_pass;
+    if (m_cost_kb <= 16 * 1024) chunks_per_pass = 8;       // 16MB: 8 chunks
+    else if (m_cost_kb <= 64 * 1024) chunks_per_pass = 16; // 64MB: 16 chunks  
+    else chunks_per_pass = 32;                              // 256MB: 32 chunks
     uint32_t slice_len = blocks_per_lane / 4;  // 4 slices in Argon2
     
     printf("Memory: %u MB, Blocks: %u, Chunks/pass: %u\n", 
