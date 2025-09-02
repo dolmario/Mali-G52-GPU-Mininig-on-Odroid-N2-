@@ -1,0 +1,10 @@
+# 1. Build
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+
+# 2. Test mit verschiedenen Memory-Größen
+RUSTICL_ENABLE=panfrost ./rin_ocl 8    # 8 MB - sollte sofort laufen
+RUSTICL_ENABLE=panfrost ./rin_ocl 32   # 32 MB - sollte stabil sein
+RUSTICL_ENABLE=panfrost ./rin_ocl 64   # 64 MB - watchdog-kritisch
+RUSTICL_ENABLE=panfrost ./rin_ocl 256  # 256 MB - nur mit Chunking!
