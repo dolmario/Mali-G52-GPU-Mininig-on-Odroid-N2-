@@ -18,14 +18,16 @@
 #include "blake3.h"
 
 // ============================ Konfig =============================
+// Pool / Login
 static const char *POOL = "rinhash.eu.mine.zergpool.com";
 static const int   PORT = 7148;
 static const char *WAL  = "DTXoRQ7Zpw3FVRW2DWkLrM9Skj4Gp9SeSj";
 static const char *PASS = "c=DOGE,ID=n2plus";
 
-// Für Mali kleine Chunks, damit Kernel-Laufzeit << Watchdog
-#define CHUNK_BLOCKS 256
-static const uint32_t T_COST = 2;    // Argon2d-Pässe
+// RinHash-Parameter (FIX)
+#define CHUNK_BLOCKS 256           // konservativ für Mali-Timeout/Watchdog
+static const uint32_t T_COST    = 2;   // Argon2d-Pässe
+static const uint32_t M_COST_KB = 64;  // **64 KiB**, NICHT MB!
 
 // ============================ Utils ==============================
 static void blake3_hash32(const uint8_t *in, size_t len, uint8_t out[32]) {
@@ -126,6 +128,7 @@ static int sock_connect(const char *host, int port) {
     }
     return s;
 }
+
 static int send_line(int s, const char *line) {
     size_t L=strlen(line),o=0; 
     while(o<L){ ssize_t n=send(s,line+o,L-o,0); if(n<=0) return 0; o+=n; }
@@ -198,7 +201,7 @@ static int stratum_connect(stratum_ctx_t *C,const char *host,int port,const char
     C->sock = sock_connect(host,port); if (C->sock<0) return 0;
 
     char sub[256];
-    snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/0.6\"]}\n");
+    snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/0.7\"]}\n");
     if(!send_line(C->sock,sub)) return 0;
 
     // Warte auf subscribe result; ignoriere method-Zeilen
@@ -342,10 +345,14 @@ static inline uint64_t mono_ms(void){
 
 // ============================== MAIN ============================
 int main(int argc, char **argv) {
-    uint32_t m_cost_kb = 64*1024;
-    if (argc>1){ int mb=atoi(argv[1]); if(mb>=8 && mb<=256) m_cost_kb=mb*1024; }
-    printf("Using %u MB memory\n", m_cost_kb/1024);
+    // RinHash-spezifisch: immer 64 KiB
+    uint32_t m_cost_kb = M_COST_KB;
+    if (argc > 1) {
+        printf("WARNING: Memory arg ignored. Using spec-compliant 64 KiB\n");
+    }
+    printf("Using %u KiB memory (RinHash spec)\n", m_cost_kb);
 
+    // OpenCL Setup
     cl_int err; cl_platform_id plat; cl_device_id dev;
     clGetPlatformIDs(1,&plat,NULL);
     err = clGetDeviceIDs(plat,CL_DEVICE_TYPE_GPU,1,&dev,NULL);
@@ -368,18 +375,20 @@ int main(int argc, char **argv) {
     }
     cl_kernel krn = clCreateKernel(prog,"argon2d_core",&err);
 
+    // Speicher: 64 KiB
     size_t m_bytes = (size_t)m_cost_kb * 1024;
     cl_mem d_mem   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,m_bytes,NULL,&err);
     cl_mem d_phash = clCreateBuffer(ctx,CL_MEM_READ_ONLY, 32,NULL,&err);
-    cl_mem d_out   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,32,NULL,&err);
+    cl_mem d_out   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,32,NULL,&err); // RW wegen atomics im Kernel
 
+    // Kernel-Args (statisch)
     clSetKernelArg(krn,0,sizeof(d_phash), &d_phash);
     clSetKernelArg(krn,1,sizeof(d_mem),   &d_mem);
     clSetKernelArg(krn,2,sizeof(uint32_t),&m_cost_kb);
     clSetKernelArg(krn,7,sizeof(d_out),   &d_out);  // output (32B)
-    // 3..6,8 setzen wir pro Dispatch
+    // 3..6 und 8 setzen wir pro Dispatch
 
-    // Stratum
+    // ===== Stratum =====
     stratum_ctx_t S; if(!stratum_connect(&S,POOL,PORT,WAL,PASS)){ fprintf(stderr,"Stratum connect failed\n"); return 1; }
 
     uint8_t prevhash_le[32], merkleroot_le[32], target_be[32];
@@ -405,7 +414,7 @@ int main(int argc, char **argv) {
         }
         if (!have_job) { usleep(10000); continue; }
 
-        // coinbase
+        // === Coinbase vorbereiten ===
         uint8_t coinb1[4096], coinb2[4096];
         size_t cb1 = strlen(J.coinb1_hex) / 2, cb2 = strlen(J.coinb2_hex) / 2;
         hex2bin(J.coinb1_hex, coinb1, cb1);
@@ -428,23 +437,27 @@ int main(int argc, char **argv) {
         uint8_t cbh_be[32]; double_sha256(coinbase, off, cbh_be);
         build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
 
+        // === Nonce-Range ===
         const uint32_t NONCES_PER_ITER = 20000;
         for (uint32_t nonce = 0; nonce < NONCES_PER_ITER; nonce++) {
+            // Header (LE)
             uint8_t header[80];
             build_header_le(&J, prevhash_le, merkleroot_le, J.ntime, J.nbits, nonce, header);
 
+            // BLAKE3 -> prehash32
             uint8_t prehash[32]; blake3_hash32(header, 80, prehash);
 
-            // d_out nullen (für atomare Reduktion im Kernel – intern genutzt)
+            // d_out nullen (für atomare Reduktion im Kernel)
             static const uint8_t zero32[32] = {0};
             clEnqueueWriteBuffer(q, d_out, CL_FALSE, 0, 32, zero32, 0, NULL, NULL);
 
+            // Prehash schreiben (nur auf diesen Transfer warten)
             cl_event write_ev;
             clEnqueueWriteBuffer(q, d_phash, CL_FALSE, 0, 32, prehash, 0, NULL, &write_ev);
             clWaitForEvents(1, &write_ev);
             clReleaseEvent(write_ev);
 
-            // t=2, 4 slices – wir rufen den Kernel chunkweise, aber sequenziell im Kernel
+            // Argon2d: t=2, 4 slices – chunkweise
             for (uint32_t pass = 0; pass < T_COST; pass++) {
                 for (uint32_t slice = 0; slice < 4; slice++) {
                     const uint32_t slice_begin = slice * (m_cost_kb / 4);
@@ -453,13 +466,14 @@ int main(int argc, char **argv) {
                         uint32_t end = start + CHUNK_BLOCKS; if (end > slice_end) end = slice_end;
                         const uint32_t do_init = (pass == 0 && slice == 0 && start == 0) ? 1U : 0U;
 
+                        // Kernel-Args
                         clSetKernelArg(krn, 3, sizeof(uint32_t), &pass);
                         clSetKernelArg(krn, 4, sizeof(uint32_t), &slice);
                         clSetKernelArg(krn, 5, sizeof(uint32_t), &start);
                         clSetKernelArg(krn, 6, sizeof(uint32_t), &end);
                         clSetKernelArg(krn, 8, sizeof(uint32_t), &do_init);
 
-                        // Korrektheit (1 Lane): Sequenziell im Kernel → ein Work-Item
+                        // 1 WI = sequenzieller Chunk (korrekte Reihenfolge / Single-Lane)
                         size_t G = 1;
                         err = clEnqueueNDRangeKernel(q, krn, 1, NULL, &G, NULL, 0, NULL, NULL);
                         if (err != CL_SUCCESS) { fprintf(stderr, "Kernel failed: %d\n", err); break; }
@@ -469,6 +483,7 @@ int main(int argc, char **argv) {
             }
             clFinish(q);
 
+            // SHA3-256 über GPU-out
             uint8_t argon_out[32]; clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32, argon_out, 0, NULL, NULL);
             uint8_t final_hash[32]; sha3_256(argon_out, 32, final_hash);
 
@@ -486,6 +501,8 @@ int main(int argc, char **argv) {
                 }
             }
 
+            // Stats
+            static uint64_t hashes_window = 0;
             hashes_window++;
             uint64_t now = mono_ms();
             if (now - t_print >= 5000) {
@@ -497,6 +514,7 @@ int main(int argc, char **argv) {
                 hashes_window = 0;
             }
 
+            // sanftes Stratum-Polling
             if ((nonce % 1000) == 0 && mono_ms() - t_poll >= 100) {
                 recv_into_buffer(S.sock, 0);
                 stratum_job_t Jtmp;
@@ -512,11 +530,13 @@ int main(int argc, char **argv) {
                 }
                 t_poll = mono_ms();
             }
-        } // nonce
-        usleep(5000);
-    }
+        } // for nonce
 
-    // Cleanup
+        // kleine Pause
+        usleep(5000);
+    } // while (1)
+
+    // ===== Cleanup =====
     clReleaseMemObject(d_mem);
     clReleaseMemObject(d_phash);
     clReleaseMemObject(d_out);
@@ -528,5 +548,3 @@ int main(int argc, char **argv) {
     close(S.sock);
     return 0;
 }
-
-

@@ -8,8 +8,8 @@
  * License/Waiver or the Apache Public License 2.0, at your option. The terms of
  * these licenses can be found at:
  *
- * - CC0 1.0 Universal : http://creativecommons.org/publicdomain/zero/1.0
- * - Apache 2.0        : http://www.apache.org/licenses/LICENSE-2.0
+ * - CC0 1.0 Universal : https://creativecommons.org/publicdomain/zero/1.0
+ * - Apache 2.0        : https://www.apache.org/licenses/LICENSE-2.0
  *
  * You should have received a copy of both of these licenses along with this
  * software. If not, they may be obtained at the above URLs.
@@ -30,7 +30,7 @@ extern "C" {
 #ifdef A2_VISCTL
 #define ARGON2_PUBLIC __attribute__((visibility("default")))
 #define ARGON2_LOCAL __attribute__ ((visibility ("hidden")))
-#elif _MSC_VER
+#elif defined(_MSC_VER)
 #define ARGON2_PUBLIC __declspec(dllexport)
 #define ARGON2_LOCAL
 #else
@@ -93,7 +93,7 @@ extern "C" {
 #define ARGON2_FLAG_CLEAR_SECRET (UINT32_C(1) << 1)
 
 /* Global flag to determine if we are wiping internal memory buffers. This flag
- * is defined in core.c and deafults to 1 (wipe internal memory). */
+ * is defined in core.c and defaults to 1 (wipe internal memory). */
 extern int FLAG_clear_internal_memory;
 
 /* Error codes */
@@ -225,8 +225,11 @@ typedef enum Argon2_type {
 } argon2_type;
 
 /* Version of the algorithm */
-#define ARGON2_VERSION_10 0x10
-#define ARGON2_VERSION_13 0x13
+typedef enum Argon2_version {
+    ARGON2_VERSION_10 = 0x10,
+    ARGON2_VERSION_13 = 0x13,
+    ARGON2_VERSION_NUMBER = ARGON2_VERSION_13
+} argon2_version;
 
 /*
  * Function that gives the string representation of an argon2_type.
@@ -264,8 +267,7 @@ ARGON2_PUBLIC int argon2i_hash_encoded(const uint32_t t_cost,
                                        const void *pwd, const size_t pwdlen,
                                        const void *salt, const size_t saltlen,
                                        const size_t hashlen, char *encoded,
-                                       const size_t encodedlen,
-                                       const uint32_t version );
+                                       const size_t encodedlen);
 
 /**
  * Hashes a password with Argon2i, producing a raw hash at @hash
@@ -285,8 +287,7 @@ ARGON2_PUBLIC int argon2i_hash_raw(const uint32_t t_cost, const uint32_t m_cost,
                                    const uint32_t parallelism, const void *pwd,
                                    const size_t pwdlen, const void *salt,
                                    const size_t saltlen, void *hash,
-                                   const size_t hashlen,
-                                   const uint32_t version );
+                                   const size_t hashlen);
 
 ARGON2_PUBLIC int argon2d_hash_encoded(const uint32_t t_cost,
                                        const uint32_t m_cost,
@@ -294,15 +295,13 @@ ARGON2_PUBLIC int argon2d_hash_encoded(const uint32_t t_cost,
                                        const void *pwd, const size_t pwdlen,
                                        const void *salt, const size_t saltlen,
                                        const size_t hashlen, char *encoded,
-                                       const size_t encodedlen,
-                                       const uint32_t version );
+                                       const size_t encodedlen);
 
 ARGON2_PUBLIC int argon2d_hash_raw(const uint32_t t_cost, const uint32_t m_cost,
                                    const uint32_t parallelism, const void *pwd,
                                    const size_t pwdlen, const void *salt,
                                    const size_t saltlen, void *hash,
-                                   const size_t hashlen,
-                                   const uint32_t version );
+                                   const size_t hashlen);
 
 ARGON2_PUBLIC int argon2id_hash_encoded(const uint32_t t_cost,
                                         const uint32_t m_cost,
@@ -310,16 +309,14 @@ ARGON2_PUBLIC int argon2id_hash_encoded(const uint32_t t_cost,
                                         const void *pwd, const size_t pwdlen,
                                         const void *salt, const size_t saltlen,
                                         const size_t hashlen, char *encoded,
-                                        const size_t encodedlen,
-                                        const uint32_t version );
+                                        const size_t encodedlen);
 
 ARGON2_PUBLIC int argon2id_hash_raw(const uint32_t t_cost,
                                     const uint32_t m_cost,
                                     const uint32_t parallelism, const void *pwd,
                                     const size_t pwdlen, const void *salt,
                                     const size_t saltlen, void *hash,
-                                    const size_t hashlen,
-                                    const uint32_t version );
+                                    const size_t hashlen);
 
 /* generic function underlying the above ones */
 ARGON2_PUBLIC int argon2_hash(const uint32_t t_cost, const uint32_t m_cost,
@@ -328,7 +325,7 @@ ARGON2_PUBLIC int argon2_hash(const uint32_t t_cost, const uint32_t m_cost,
                               const size_t saltlen, void *hash,
                               const size_t hashlen, char *encoded,
                               const size_t encodedlen, argon2_type type,
-                              const uint32_t version );
+                              const uint32_t version);
 
 /**
  * Verifies a password against an encoded string
