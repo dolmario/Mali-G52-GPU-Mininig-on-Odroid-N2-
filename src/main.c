@@ -10,9 +10,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <fcntl.h>
+#include <sys/select.h>
+#include <errno.h>
 #include "blake3.h"
-
-
 
 // === Helper: JSON String Extractor ===
 static int get_next_quoted(const char **pp, const char *end, char *out, size_t cap) {
@@ -35,8 +36,6 @@ static int get_next_quoted(const char **pp, const char *end, char *out, size_t c
     *pp = q2 + 1;  // weiter hinter dem String
     return 1;
 }
-
-
 
 // ---------- Stratum + Job Strukturen ----------
 typedef struct {
@@ -62,7 +61,7 @@ typedef struct {
     int      clean;
 } stratum_job_t;
 
-// ---------- Utils ----------
+// ---------- Utils mit EVP API ----------
 static int hex2bin(const char *hex, uint8_t *out, size_t outlen) {
     for (size_t i=0;i<outlen;i++) {
         unsigned v;
@@ -73,20 +72,38 @@ static int hex2bin(const char *hex, uint8_t *out, size_t outlen) {
 }
 static void flip32(uint8_t *p) { for (int i=0;i<16;i++){ uint8_t t=p[i]; p[i]=p[31-i]; p[31-i]=t; } }
 
+// SHA256 mit EVP API (OpenSSL 3.0 kompatibel)
 static void sha256_once(const uint8_t *in, size_t len, uint8_t out[32]) {
-    SHA256_CTX c; SHA256_Init(&c); SHA256_Update(&c, in, len); SHA256_Final(out, &c);
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return;
+    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+    EVP_DigestUpdate(ctx, in, len);
+    unsigned int olen = 0;
+    EVP_DigestFinal_ex(ctx, out, &olen);
+    EVP_MD_CTX_free(ctx);
 }
+
 static void double_sha256(const uint8_t *in, size_t len, uint8_t out[32]) {
-    uint8_t t[32]; sha256_once(in,len,t); sha256_once(t,32,out);
+    uint8_t t[32]; 
+    sha256_once(in, len, t); 
+    sha256_once(t, 32, out);
 }
+
 static void blake3_hash32(const uint8_t *in, size_t inlen, uint8_t out[32]) {
-    blake3_hasher h; blake3_hasher_init(&h); blake3_hasher_update(&h,in,inlen); blake3_hasher_finalize(&h,out,32);
+    blake3_hasher h; 
+    blake3_hasher_init(&h); 
+    blake3_hasher_update(&h, in, inlen); 
+    blake3_hasher_finalize(&h, out, 32);
 }
+
 static void sha3_256(const uint8_t *in, size_t inlen, uint8_t out[32]) {
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return;
     EVP_DigestInit_ex(ctx, EVP_sha3_256(), NULL);
     EVP_DigestUpdate(ctx, in, inlen);
-    unsigned olen=0; EVP_DigestFinal_ex(ctx, out, &olen); EVP_MD_CTX_free(ctx);
+    unsigned int olen = 0; 
+    EVP_DigestFinal_ex(ctx, out, &olen); 
+    EVP_MD_CTX_free(ctx);
 }
 
 // nbits → 32B Target (big-endian) für direkten BE-Vergleich
@@ -110,11 +127,13 @@ static void target_from_nbits(uint32_t nbits, uint8_t target[32]) {
     }
 }
 
-// ---------- Stratum Minimal ----------
+// ---------- Stratum mit non-blocking Socket ----------
 static int sock_connect(const char *host, int port) {
-    struct addrinfo hints = {0}, *res=NULL,*p=NULL; char portstr[16];
+    struct addrinfo hints = {0}, *res=NULL,*p=NULL; 
+    char portstr[16];
     snprintf(portstr,sizeof portstr,"%d",port);
-    hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM; 
+    hints.ai_family = AF_UNSPEC;
     if (getaddrinfo(host,portstr,&hints,&res)!=0) return -1;
     int s=-1;
     for (p=res;p;p=p->ai_next) {
@@ -123,20 +142,65 @@ static int sock_connect(const char *host, int port) {
         if (connect(s,p->ai_addr,p->ai_addrlen)==0) break;
         close(s); s=-1;
     }
-    freeaddrinfo(res); return s;
+    freeaddrinfo(res); 
+    return s;
 }
-static int send_line(int s, const char *line){ size_t L=strlen(line),o=0; while(o<L){ ssize_t n=send(s,line+o,L-o,0); if(n<=0) return 0; o+=n; } return 1; }
-static int recv_line(int s, char *buf, size_t cap){
-    size_t o=0; while(o+1<cap){ char c; ssize_t n=recv(s,&c,1,0); if(n<=0) return -1; buf[o++]=c; if(c=='\n') break; }
-    buf[o]=0; return (int)o;
+
+static int send_line(int s, const char *line) { 
+    size_t L=strlen(line),o=0; 
+    while(o<L){ 
+        ssize_t n=send(s,line+o,L-o,0); 
+        if(n<=0) return 0; 
+        o+=n; 
+    } 
+    return 1; 
+}
+
+static int recv_line_nonblocking(int s, char *buf, size_t cap, int timeout_ms) {
+    fd_set readfds;
+    struct timeval tv;
+    FD_ZERO(&readfds);
+    FD_SET(s, &readfds);
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    
+    int sel = select(s + 1, &readfds, NULL, NULL, &tv);
+    if (sel <= 0) return 0; // timeout oder error
+    
+    size_t o = 0;
+    while (o + 1 < cap) {
+        char c;
+        ssize_t n = recv(s, &c, 1, MSG_DONTWAIT);
+        if (n <= 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            return -1;
+        }
+        buf[o++] = c;
+        if (c == '\n') break;
+    }
+    buf[o] = 0;
+    return (int)o;
+}
+
+static int make_socket_nonblocking(int sock) {
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags == -1) return 0;
+    return fcntl(sock, F_SETFL, flags | O_NONBLOCK) != -1;
 }
 
 static int stratum_connect(stratum_ctx_t *C, const char *host,int port,const char *user,const char *pass){
     memset(C,0,sizeof *C);
-    snprintf(C->host,sizeof C->host,"%s",host); C->port=port;
+    snprintf(C->host,sizeof C->host,"%s",host); 
+    C->port=port;
     snprintf(C->wallet,sizeof C->wallet,"%s",user);
     snprintf(C->pass,sizeof C->pass,"%s",pass);
-    C->sock = sock_connect(host,port); if(C->sock<0) return 0;
+    C->sock = sock_connect(host,port); 
+    if(C->sock<0) return 0;
+    
+    // Socket non-blocking machen
+    if (!make_socket_nonblocking(C->sock)) {
+        printf("Warning: Could not make socket non-blocking\n");
+    }
 
     // subscribe
     char sub[256];
@@ -145,14 +209,13 @@ static int stratum_connect(stratum_ctx_t *C, const char *host,int port,const cha
 
     // parse result: [sub_details, extranonce1, extranonce2_size]
     char line[8192];
-    while(1){
-        if(recv_line(C->sock,line,sizeof line)<=0) return 0;
-        if(strstr(line,"\"result\"")){
+    int retries = 0;
+    while(retries < 50) { // 5 Sekunden timeout
+        int n = recv_line_nonblocking(C->sock, line, sizeof line, 100);
+        if (n > 0 && strstr(line,"\"result\"")) {
             // extract extranonce1
             char *lb=strchr(line,'['); char *rb=strrchr(line,']');
             if(!lb||!rb) break;
-            // find first quoted after sub_details (skip first [] by finding \", then next \")
-            // crude: find second quoted string overall
             char *q=strchr(lb,'\"'); if(!q) break;
             q=strchr(q+1,'\"'); if(!q) break; // end of first quoted
             char *q1=strchr(q+1,'\"'); if(!q1) break;
@@ -165,18 +228,29 @@ static int stratum_connect(stratum_ctx_t *C, const char *host,int port,const cha
             if(C->extranonce2_size==0) C->extranonce2_size=4;
             break;
         }
+        retries++;
+        usleep(100000); // 100ms
     }
+    
     // authorize
     char auth[512];
     snprintf(auth,sizeof auth,"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}\n",C->wallet,C->pass);
     if(!send_line(C->sock,auth)) return 0;
-    // read ack
-    while(1){
-        if(recv_line(C->sock,line,sizeof line)<=0) return 0;
-        if(strstr(line,"\"result\":true")) break;
-        if(strstr(line,"\"mining.notify\"")) break; // job may already come
+    
+    // read ack - mit timeout
+    retries = 0;
+    while(retries < 50) {
+        int n = recv_line_nonblocking(C->sock, line, sizeof line, 100);
+        if (n > 0) {
+            if(strstr(line,"\"result\":true")) break;
+            if(strstr(line,"\"mining.notify\"")) break; // job may already come
+        }
+        retries++;
+        usleep(100000);
     }
-    printf("Stratum: extranonce1=%s, extranonce2_size=%u\n", C->extranonce1, C->extranonce2_size);
+    
+    printf("Connected to %s:%d\n", C->host, C->port);
+    printf("Extranonce1=%s, extranonce2_size=%u\n", C->extranonce1, C->extranonce2_size);
     return 1;
 }
 
@@ -207,7 +281,6 @@ static int stratum_parse_notify(const char *line, stratum_job_t *J){
     if (!get_next_quoted(&p, rb, J->coinb2_hex, sizeof(J->coinb2_hex))) return 0;
 
     // 5: merkle[] (Array aus Strings)
-    // finde das nächste '[' und sein korrespondierendes ']'
     const char *m_lb = NULL, *m_rb = NULL;
     {
         const char *scan = p;
@@ -225,32 +298,27 @@ static int stratum_parse_notify(const char *line, stratum_job_t *J){
             snprintf(J->merkle_hex[J->merkle_count], sizeof(J->merkle_hex[0]), "%s", tmp);
             J->merkle_count++;
         }
-        p = m_rb + 1; // nach dem Merkle-Array weitermachen
+        p = m_rb + 1;
     }
 
-    // 6: version (quoted hex)
+    // 6-8: version, nbits, ntime
     {
         char vhex[16] = {0};
         if (!get_next_quoted(&p, rb, vhex, sizeof(vhex))) return 0;
         sscanf(vhex, "%x", &J->version);
     }
-
-    // 7: nbits (quoted hex)
     {
         char nbhex[16] = {0};
         if (!get_next_quoted(&p, rb, nbhex, sizeof(nbhex))) return 0;
         sscanf(nbhex, "%x", &J->nbits);
     }
-
-    // 8: ntime (quoted hex)
     {
         char nth[16] = {0};
         if (!get_next_quoted(&p, rb, nth, sizeof(nth))) return 0;
         sscanf(nth, "%x", &J->ntime);
     }
 
-    // 9: clean_jobs (bool) – grob erkennen
-    // wir schauen nur, ob irgendwo hinterher "true" / "false" steht
+    // 9: clean_jobs
     J->clean = 0;
     {
         const char *boolp = strstr(p, "true");
@@ -260,15 +328,14 @@ static int stratum_parse_notify(const char *line, stratum_job_t *J){
     return 1;
 }
 
-
-static int stratum_get_job(stratum_ctx_t *C, stratum_job_t *J){
+static int stratum_get_job_nonblocking(stratum_ctx_t *C, stratum_job_t *J){
     char line[16384];
-    while(1){
-        int n = recv_line(C->sock,line,sizeof line);
-        if(n<=0) return 0;
-        if(stratum_parse_notify(line,J)) return 1;
-        // ignore other
+    int n = recv_line_nonblocking(C->sock, line, sizeof line, 10); // 10ms timeout
+    if (n > 0 && stratum_parse_notify(line, J)) {
+        printf("New job: %s (clean=%d)\n", J->job_id, J->clean);
+        return 1;
     }
+    return 0;
 }
 
 static int stratum_submit(stratum_ctx_t *C, const stratum_job_t *J,
@@ -320,10 +387,19 @@ static void build_header_le(const stratum_job_t *J, const uint8_t prevhash_le[32
 
 // ---------- OpenCL Helper ----------
 static char* load_kernel_source(const char *path) {
-    FILE *f=fopen(path,"rb"); if(!f){ perror("kernel"); exit(1); }
-    fseek(f,0,SEEK_END); long sz=ftell(f); rewind(f);
+    FILE *f=fopen(path,"rb"); 
+    if(!f){ 
+        perror("kernel"); 
+        exit(1); 
+    }
+    fseek(f,0,SEEK_END); 
+    long sz=ftell(f); 
+    rewind(f);
     char *src=(char*)malloc(sz+1);
-    fread(src,1,sz,f); src[sz]=0; fclose(f); return src;
+    fread(src,1,sz,f); 
+    src[sz]=0; 
+    fclose(f); 
+    return src;
 }
 
 // ================== MAIN ==================
@@ -334,33 +410,47 @@ int main(int argc, char **argv) {
     static const char *WAL  = "DTXoRQ7Zpw3FVRW2DWkLrM9Skj4Gp9SeSj";
     static const char *PASS = "c=DOGE,ID=n2plus";
 
-
-
     // --- OpenCL Setup ---
     uint32_t m_cost_kb = 64*1024; // Default 64MB
-    if (argc>1){ int mb=atoi(argv[1]); if(mb>=8 && mb<=256) m_cost_kb=mb*1024; }
+    if (argc>1){ 
+        int mb=atoi(argv[1]); 
+        if(mb>=8 && mb<=256) m_cost_kb=mb*1024; 
+    }
     printf("Using %u MB memory\n", m_cost_kb/1024);
 
-    cl_int err; cl_platform_id platform; cl_device_id device;
+    cl_int err; 
+    cl_platform_id platform; 
+    cl_device_id device;
     clGetPlatformIDs(1,&platform,NULL);
     err = clGetDeviceIDs(platform,CL_DEVICE_TYPE_GPU,1,&device,NULL);
-    if(err!=CL_SUCCESS){ fprintf(stderr,"No GPU device found\n"); return 1; }
+    if(err!=CL_SUCCESS){ 
+        fprintf(stderr,"No GPU device found\n"); 
+        return 1; 
+    }
 
-    char devname[256]; clGetDeviceInfo(device,CL_DEVICE_NAME,sizeof devname,devname,NULL);
+    char devname[256]; 
+    clGetDeviceInfo(device,CL_DEVICE_NAME,sizeof devname,devname,NULL);
     printf("Device: %s\n", devname);
 
     cl_context ctx = clCreateContext(NULL,1,&device,NULL,NULL,&err);
     cl_command_queue q = clCreateCommandQueue(ctx,device,0,&err);
-    if(err!=CL_SUCCESS){ fprintf(stderr,"clCreateCommandQueue: %d\n",err); return 1; }
+    if(err!=CL_SUCCESS){ 
+        fprintf(stderr,"clCreateCommandQueue: %d\n",err); 
+        return 1; 
+    }
 
     char *ksrc = load_kernel_source("rinhash_argon2d.cl");
     cl_program prog = clCreateProgramWithSource(ctx,1,(const char**)&ksrc,NULL,&err);
     err = clBuildProgram(prog,1,&device,"-cl-std=CL1.2",NULL,NULL);
     if(err!=CL_SUCCESS){
-        size_t L; clGetProgramBuildInfo(prog,device,CL_PROGRAM_BUILD_LOG,0,NULL,&L);
+        size_t L; 
+        clGetProgramBuildInfo(prog,device,CL_PROGRAM_BUILD_LOG,0,NULL,&L);
         char *log=(char*)malloc(L+1);
-        clGetProgramBuildInfo(prog,device,CL_PROGRAM_BUILD_LOG,L,log,NULL); log[L]=0;
-        fprintf(stderr,"Build failed:\n%s\n",log); free(log); return 1;
+        clGetProgramBuildInfo(prog,device,CL_PROGRAM_BUILD_LOG,L,log,NULL); 
+        log[L]=0;
+        fprintf(stderr,"Build failed:\n%s\n",log); 
+        free(log); 
+        return 1;
     }
     cl_kernel krn = clCreateKernel(prog,"argon2d_core",&err);
 
@@ -370,112 +460,198 @@ int main(int argc, char **argv) {
     cl_mem d_out    = clCreateBuffer(ctx,CL_MEM_WRITE_ONLY,32,NULL,&err);
 
     uint32_t t_cost=2, lanes=1;
+    
+    // Kernel-Argumente mit Chunking-Parametern
     clSetKernelArg(krn,0,sizeof(d_phash),&d_phash);
     clSetKernelArg(krn,1,sizeof(d_mem),  &d_mem);
     clSetKernelArg(krn,2,sizeof(uint32_t),&m_cost_kb);
     clSetKernelArg(krn,3,sizeof(uint32_t),&t_cost);
     clSetKernelArg(krn,4,sizeof(uint32_t),&lanes);
     clSetKernelArg(krn,5,sizeof(d_out),  &d_out);
+    // Args 6 und 7 werden für start_idx und end_idx in der Loop gesetzt
 
     // --- Stratum ---
     stratum_ctx_t S;
-    if(!stratum_connect(&S,POOL,PORT,WAL,PASS)){ fprintf(stderr,"Stratum connect failed\n"); return 1; }
-    printf("Connected to %s:%d\n", POOL, PORT);
+    if(!stratum_connect(&S,POOL,PORT,WAL,PASS)){ 
+        fprintf(stderr,"Stratum connect failed\n"); 
+        return 1; 
+    }
 
     // prevhash LE vorbereiten pro Job
     uint8_t prevhash_le[32], merkleroot_le[32];
+    stratum_job_t current_job;
+    int have_job = 0;
 
     // --- Mining Loop ---
     while(1){
-        stratum_job_t J;
-        if(!stratum_get_job(&S,&J)) { fprintf(stderr,"get_job failed\n"); sleep(2); continue; }
-
-        // prevhash hex (BE) -> bin -> LE
-        hex2bin(J.prevhash_hex, prevhash_le, 32); flip32(prevhash_le);
+        // Check für neuen Job (non-blocking)
+        stratum_job_t new_job;
+        if (stratum_get_job_nonblocking(&S, &new_job)) {
+            current_job = new_job;
+            have_job = 1;
+            // prevhash hex (BE) -> bin -> LE
+            hex2bin(current_job.prevhash_hex, prevhash_le, 32); 
+            flip32(prevhash_le);
+        }
+        
+        if (!have_job) {
+            usleep(100000); // 100ms warten
+            continue;
+        }
 
         // extranonce2 Schleife
         uint32_t en2_counter = 1;
+        time_t last_hashrate = time(NULL);
+        unsigned total_hashes = 0;
+        
         for(;; en2_counter++){
+            // Check für neuen Job
+            if (stratum_get_job_nonblocking(&S, &new_job)) {
+                if (strcmp(current_job.job_id, new_job.job_id) != 0) {
+                    current_job = new_job;
+                    hex2bin(current_job.prevhash_hex, prevhash_le, 32); 
+                    flip32(prevhash_le);
+                    en2_counter = 1; // Reset für neuen Job
+                    printf("Switching to new job: %s\n", current_job.job_id);
+                }
+            }
+            
             // extranonce1 (hex vom Pool) -> bin
-            uint8_t en1[64]; size_t en1b = strlen(S.extranonce1)/2; if(en1b>64) en1b=64;
+            uint8_t en1[64]; 
+            size_t en1b = strlen(S.extranonce1)/2; 
+            if(en1b>64) en1b=64;
             hex2bin(S.extranonce1, en1, en1b);
-            // extranonce2 -> hex mit richtiger Länge (bytes = extranonce2_size)
-            char en2_hex[64]; int en2_bytes = (int)S.extranonce2_size;
+            
+            // extranonce2 -> hex mit richtiger Länge
+            char en2_hex[64]; 
+            int en2_bytes = (int)S.extranonce2_size;
             {
-                // hex-string mit führenden Nullen
-                char tmp[64]; snprintf(tmp,sizeof tmp,"%0*x", en2_bytes*2, en2_counter);
+                char tmp[64]; 
+                snprintf(tmp,sizeof tmp,"%0*x", en2_bytes*2, en2_counter);
                 snprintf(en2_hex,sizeof en2_hex,"%s", tmp);
             }
-            uint8_t en2[64]; hex2bin(en2_hex, en2, en2_bytes);
+            uint8_t en2[64]; 
+            hex2bin(en2_hex, en2, en2_bytes);
 
             // coinbase = coinb1 + en1 + en2 + coinb2
             uint8_t coinb1[1024], coinb2[1024];
-            size_t cb1 = strlen(J.coinb1_hex)/2, cb2 = strlen(J.coinb2_hex)/2;
-            hex2bin(J.coinb1_hex, coinb1, cb1);
-            hex2bin(J.coinb2_hex, coinb2, cb2);
-            uint8_t coinbase[4096]; size_t off=0;
+            size_t cb1 = strlen(current_job.coinb1_hex)/2, cb2 = strlen(current_job.coinb2_hex)/2;
+            hex2bin(current_job.coinb1_hex, coinb1, cb1);
+            hex2bin(current_job.coinb2_hex, coinb2, cb2);
+            uint8_t coinbase[4096]; 
+            size_t off=0;
             memcpy(coinbase+off,coinb1,cb1); off+=cb1;
             memcpy(coinbase+off,en1,en1b);   off+=en1b;
             memcpy(coinbase+off,en2,en2_bytes); off+=en2_bytes;
             memcpy(coinbase+off,coinb2,cb2); off+=cb2;
 
             // coinbase hash (dSHA256, BE)
-            uint8_t coinbase_hash_be[32]; double_sha256(coinbase,off,coinbase_hash_be);
+            uint8_t coinbase_hash_be[32]; 
+            double_sha256(coinbase,off,coinbase_hash_be);
 
             // Merkle-Root in LE bauen
-            build_merkle_root_le(coinbase_hash_be, J.merkle_hex, J.merkle_count, merkleroot_le);
+            build_merkle_root_le(coinbase_hash_be, current_job.merkle_hex, current_job.merkle_count, merkleroot_le);
 
-            // Nonce Fenster
-            uint8_t target_be[32]; target_from_nbits(J.nbits, target_be);
+            // Target
+            uint8_t target_be[32]; 
+            target_from_nbits(current_job.nbits, target_be);
 
-            // kleine Statistik
-            time_t t0=time(NULL); unsigned hashes=0;
-
-            for(uint32_t nonce=0; nonce<200000; nonce++){
+            // Nonce Range - jetzt in Chunks
+            const uint32_t CHUNK_SIZE = 128; // Blöcke pro Kernel-Aufruf
+            const uint32_t MAX_NONCE = 50000;
+            
+            for(uint32_t nonce_start = 0; nonce_start < MAX_NONCE; nonce_start += CHUNK_SIZE){
+                uint32_t nonce_end = nonce_start + CHUNK_SIZE;
+                if (nonce_end > MAX_NONCE) nonce_end = MAX_NONCE;
+                
+                // Header für diesen Nonce-Bereich (wir nehmen nonce_start als Basis)
                 uint8_t header[80];
-                build_header_le(&J, prevhash_le, merkleroot_le, J.ntime, J.nbits, nonce, header);
+                build_header_le(&current_job, prevhash_le, merkleroot_le, current_job.ntime, current_job.nbits, nonce_start, header);
 
-                // RinHash
-                uint8_t ph[32]; blake3_hash32(header,80,ph);
+                // RinHash: BLAKE3
+                uint8_t ph[32]; 
+                blake3_hash32(header,80,ph);
 
+                // Kernel mit Chunking-Parametern aufrufen
                 clEnqueueWriteBuffer(q,d_phash,CL_TRUE,0,32,ph,0,NULL,NULL);
+                
+                uint32_t start_idx = nonce_start;
+                uint32_t end_idx = nonce_end;
+                clSetKernelArg(krn,6,sizeof(uint32_t),&start_idx);
+                clSetKernelArg(krn,7,sizeof(uint32_t),&end_idx);
+                
                 size_t G=1;
                 err = clEnqueueNDRangeKernel(q,krn,1,NULL,&G,NULL,0,NULL,NULL);
-                if(err!=CL_SUCCESS){ fprintf(stderr,"Kernel failed: %d\n",err); break; }
+                if(err!=CL_SUCCESS){ 
+                    fprintf(stderr,"Kernel failed: %d\n",err); 
+                    break; 
+                }
+                clFlush(q); // Nach jedem Chunk flushen
                 clFinish(q);
 
-                uint8_t argon_out[32]; clEnqueueReadBuffer(q,d_out,CL_TRUE,0,32,argon_out,0,NULL,NULL);
-                uint8_t final_be[32]; sha3_256(argon_out,32,final_be);
+                uint8_t argon_out[32]; 
+                clEnqueueReadBuffer(q,d_out,CL_TRUE,0,32,argon_out,0,NULL,NULL);
+                
+                // SHA3-256 final hash
+                uint8_t final_be[32]; 
+                sha3_256(argon_out,32,final_be);
 
-                // Vergleich BE: final < target ?
+                // Target-Vergleich (BE): final < target ?
                 int less=0, greater=0;
                 for(int i=0;i<32;i++){
                     if(final_be[i] < target_be[i]) { less=1; break; }
                     if(final_be[i] > target_be[i]) { greater=1; break; }
                 }
                 if(less && !greater){
-                    // Share submit
-                    char en2_hex_full[64]; snprintf(en2_hex_full,sizeof en2_hex_full,"%0*x", en2_bytes*2, en2_counter);
-                    if(stratum_submit(&S,&J,en2_hex_full,J.ntime,nonce)){
-                        printf("Share submitted: job=%s en2=%s nonce=%08x\n", J.job_id, en2_hex_full, nonce);
+                    // Share gefunden! Submit
+                    char en2_hex_full[64]; 
+                    snprintf(en2_hex_full,sizeof en2_hex_full,"%0*x", en2_bytes*2, en2_counter);
+                    if(stratum_submit(&S,&current_job,en2_hex_full,current_job.ntime,nonce_start)){
+                        printf("Share submitted: job=%s en2=%s nonce=%08x\n", 
+                               current_job.job_id, en2_hex_full, nonce_start);
                     } else {
-                        fprintf(stderr,"Submit failed\n");
+                        fprintf(stderr,"Share submit failed\n");
                     }
                 }
 
-                hashes++;
-                if((hashes % 5000)==0){
-                    time_t dt=time(NULL)-t0; if(dt==0) dt=1;
-                    printf("Speed ~ %u H/s | job %s\n", hashes/(unsigned)dt, J.job_id);
+                total_hashes += (nonce_end - nonce_start);
+                
+                // Hashrate alle 10 Sekunden ausgeben
+                time_t now = time(NULL);
+                if (now - last_hashrate >= 10) {
+                    double elapsed = difftime(now, last_hashrate);
+                    double hashrate = total_hashes / elapsed;
+                    printf("Hashrate: %.1f H/s | Job: %s\n", hashrate, current_job.job_id);
+                    last_hashrate = now;
+                    total_hashes = 0;
+                }
+                
+                // Check für neuen Job zwischen Chunks
+                if (stratum_get_job_nonblocking(&S, &new_job)) {
+                    if (strcmp(current_job.job_id, new_job.job_id) != 0) {
+                        current_job = new_job;
+                        hex2bin(current_job.prevhash_hex, prevhash_le, 32); 
+                        flip32(prevhash_le);
+                        printf("Job changed during mining, switching to: %s\n", current_job.job_id);
+                        goto next_extranonce2; // Break aus Nonce-Loop
+                    }
                 }
             }
-            // bei clean-jobs brich ab auf nächstes notify
-            // (hier simpel: wir laufen weiter, bis neuer Job kommt)
+            
+            next_extranonce2:;
+            // bei clean-jobs oder nach Durchlauf aller Nonces weiter mit nächster extranonce2
         }
     }
 
     // Cleanup (theoretisch nie erreicht)
-    clReleaseMemObject(d_mem); clReleaseMemObject(d_phash); clReleaseMemObject(d_out);
-    clReleaseKernel(krn); clReleaseProgram(prog); clReleaseCommandQueue(q); clReleaseContext(ctx); free(ksrc);
+    clReleaseMemObject(d_mem); 
+    clReleaseMemObject(d_phash); 
+    clReleaseMemObject(d_out);
+    clReleaseKernel(krn); 
+    clReleaseProgram(prog); 
+    clReleaseCommandQueue(q); 
+    clReleaseContext(ctx); 
+    free(ksrc);
+    close(S.sock);
     return 0;
 }
