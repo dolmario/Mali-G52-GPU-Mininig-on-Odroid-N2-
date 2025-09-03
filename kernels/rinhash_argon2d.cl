@@ -144,4 +144,3 @@ __kernel void argon2d_core(
         out64[3] ^= mem64[dstb + 3];
     }
 }
-
