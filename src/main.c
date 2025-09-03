@@ -328,11 +328,12 @@ static char* load_kernel_source(const char *path) {
 
 // ================== MAIN ==================
 int main(int argc, char **argv) {
-    // Pool configuration
-    const char *POOL_HOST = "rinhash.eu.mine.zergpool.com";
-    const int POOL_PORT = 7148;
-    const char *WALLET = "DTXoRQ7Zpw3FVRW2DWkLrM9Skj4Gp9SeSj";
-    const char *PASS   = "c=DOGE,ID=n2plus";
+    // Pool-Konfiguration (RinHash @ Zergpool)
+    static const char *POOL = "rinhash.eu.mine.zergpool.com";
+    static const int   PORT = 7148;
+    static const char *WAL  = "DTXoRQ7Zpw3FVRW2DWkLrM9Skj4Gp9SeSj";
+    static const char *PASS = "c=DOGE,ID=n2plus";
+
 
 
     // --- OpenCL Setup ---
