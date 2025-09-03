@@ -461,14 +461,13 @@ int main(int argc, char **argv) {
 
     uint32_t t_cost=2, lanes=1;
     
-    // Kernel-Argumente mit Chunking-Parametern
+    // Kernel-Argumente
     clSetKernelArg(krn,0,sizeof(d_phash),&d_phash);
     clSetKernelArg(krn,1,sizeof(d_mem),  &d_mem);
     clSetKernelArg(krn,2,sizeof(uint32_t),&m_cost_kb);
     clSetKernelArg(krn,3,sizeof(uint32_t),&t_cost);
     clSetKernelArg(krn,4,sizeof(uint32_t),&lanes);
     clSetKernelArg(krn,5,sizeof(d_out),  &d_out);
-    // Args 6 und 7 werden für start_idx und end_idx in der Loop gesetzt
 
     // --- Stratum ---
     stratum_ctx_t S;
@@ -556,90 +555,129 @@ int main(int argc, char **argv) {
             uint8_t target_be[32]; 
             target_from_nbits(current_job.nbits, target_be);
 
-            // Nonce Range - jetzt in Chunks
-            const uint32_t CHUNK_SIZE = 128; // Blöcke pro Kernel-Aufruf
-            const uint32_t MAX_NONCE = 50000;
+            // Debug: Target ausgeben
+            static int first_target = 1;
+            if (first_target) {
+                printf("Target: ");
+                for(int i=0; i<32; i++) printf("%02x", target_be[i]);
+                printf("\n");
+                first_target = 0;
+            }
+
+            // Nonce Range mining - JEDEN Nonce einzeln hashen!
+            const uint32_t MAX_NONCE = 100000; // Erstmal kleiner für Tests
             
-            for(uint32_t nonce_start = 0; nonce_start < MAX_NONCE; nonce_start += CHUNK_SIZE){
-                uint32_t nonce_end = nonce_start + CHUNK_SIZE;
-                if (nonce_end > MAX_NONCE) nonce_end = MAX_NONCE;
-                
-                // Header für diesen Nonce-Bereich (wir nehmen nonce_start als Basis)
+            for(uint32_t nonce = 0; nonce < MAX_NONCE; nonce++){
+                // Header für diesen spezifischen Nonce
                 uint8_t header[80];
-                build_header_le(&current_job, prevhash_le, merkleroot_le, current_job.ntime, current_job.nbits, nonce_start, header);
+                build_header_le(&current_job, prevhash_le, merkleroot_le, 
+                               current_job.ntime, current_job.nbits, nonce, header);
 
-                // RinHash: BLAKE3
+                // Step 1: BLAKE3 vom Header
                 uint8_t ph[32]; 
-                blake3_hash32(header,80,ph);
+                blake3_hash32(header, 80, ph);
 
-                // Kernel mit Chunking-Parametern aufrufen
-                clEnqueueWriteBuffer(q,d_phash,CL_TRUE,0,32,ph,0,NULL,NULL);
+                // Step 2: Argon2d auf GPU - MIT CHUNKING für Mali watchdog
+                clEnqueueWriteBuffer(q, d_phash, CL_TRUE, 0, 32, ph, 0, NULL, NULL);
                 
-                uint32_t start_idx = nonce_start;
-                uint32_t end_idx = nonce_end;
-                clSetKernelArg(krn,6,sizeof(uint32_t),&start_idx);
-                clSetKernelArg(krn,7,sizeof(uint32_t),&end_idx);
-                
-                size_t G=1;
-                err = clEnqueueNDRangeKernel(q,krn,1,NULL,&G,NULL,0,NULL,NULL);
-                if(err!=CL_SUCCESS){ 
-                    fprintf(stderr,"Kernel failed: %d\n",err); 
-                    break; 
+                // Argon2d in Chunks ausführen (wichtig für Mali!)
+                const uint32_t CHUNK_SIZE = 512; // Blöcke pro Kernel-Aufruf
+                for(uint32_t chunk_start = 0; chunk_start < m_cost_kb; chunk_start += CHUNK_SIZE){
+                    uint32_t chunk_end = chunk_start + CHUNK_SIZE;
+                    if(chunk_end > m_cost_kb) chunk_end = m_cost_kb;
+                    
+                    clSetKernelArg(krn, 6, sizeof(uint32_t), &chunk_start);
+                    clSetKernelArg(krn, 7, sizeof(uint32_t), &chunk_end);
+                    
+                    size_t G = 1;
+                    err = clEnqueueNDRangeKernel(q, krn, 1, NULL, &G, NULL, 0, NULL, NULL);
+                    if(err != CL_SUCCESS){ 
+                        fprintf(stderr, "Kernel failed: %d\n", err); 
+                        break; 
+                    }
+                    clFlush(q);
                 }
-                clFlush(q); // Nach jedem Chunk flushen
-                clFinish(q);
-
+                clFinish(q); // Warte bis Argon2d komplett fertig ist
+                
+                // Argon2d Output lesen
                 uint8_t argon_out[32]; 
-                clEnqueueReadBuffer(q,d_out,CL_TRUE,0,32,argon_out,0,NULL,NULL);
+                clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32, argon_out, 0, NULL, NULL);
                 
-                // SHA3-256 final hash
-                uint8_t final_be[32]; 
-                sha3_256(argon_out,32,final_be);
-
-                // Target-Vergleich (BE): final < target ?
-                int less=0, greater=0;
-                for(int i=0;i<32;i++){
-                    if(final_be[i] < target_be[i]) { less=1; break; }
-                    if(final_be[i] > target_be[i]) { greater=1; break; }
-                }
-                if(less && !greater){
-                    // Share gefunden! Submit
-                    char en2_hex_full[64]; 
-                    snprintf(en2_hex_full,sizeof en2_hex_full,"%0*x", en2_bytes*2, en2_counter);
-                    if(stratum_submit(&S,&current_job,en2_hex_full,current_job.ntime,nonce_start)){
-                        printf("Share submitted: job=%s en2=%s nonce=%08x\n", 
-                               current_job.job_id, en2_hex_full, nonce_start);
-                    } else {
-                        fprintf(stderr,"Share submit failed\n");
+                // Step 3: SHA3-256 final hash
+                uint8_t final_hash[32]; 
+                sha3_256(argon_out, 32, final_hash);
+                
+                // Target-Vergleich (als BE bytes)
+                int found = 1;
+                for(int i = 0; i < 32; i++){
+                    if(final_hash[i] < target_be[i]) {
+                        found = 1;
+                        break;
+                    }
+                    if(final_hash[i] > target_be[i]) {
+                        found = 0;
+                        break;
                     }
                 }
-
-                total_hashes += (nonce_end - nonce_start);
                 
-                // Hashrate alle 10 Sekunden ausgeben
-                time_t now = time(NULL);
-                if (now - last_hashrate >= 10) {
-                    double elapsed = difftime(now, last_hashrate);
-                    double hashrate = total_hashes / elapsed;
-                    printf("Hashrate: %.1f H/s | Job: %s\n", hashrate, current_job.job_id);
-                    last_hashrate = now;
-                    total_hashes = 0;
+                if(found){
+                    printf("\n*** SHARE FOUND! ***\n");
+                    printf("Nonce: %08x\n", nonce);
+                    printf("Hash: ");
+                    for(int i=0; i<32; i++) printf("%02x", final_hash[i]);
+                    printf("\n");
+                    printf("Target: ");
+                    for(int i=0; i<32; i++) printf("%02x", target_be[i]);
+                    printf("\n");
+                    
+                    // Submit share
+                    char en2_hex_full[64]; 
+                    snprintf(en2_hex_full, sizeof en2_hex_full, "%0*x", 
+                             en2_bytes*2, en2_counter);
+                    
+                    if(stratum_submit(&S, &current_job, en2_hex_full, 
+                                     current_job.ntime, nonce)){
+                        printf("Share submitted successfully!\n\n");
+                    } else {
+                        fprintf(stderr, "Share submit failed\n");
+                    }
+                    
+                    // Nach gefundenem Share mit nächster extranonce2 weitermachen
+                    break;
                 }
                 
-                // Check für neuen Job zwischen Chunks
-                if (stratum_get_job_nonblocking(&S, &new_job)) {
-                    if (strcmp(current_job.job_id, new_job.job_id) != 0) {
-                        current_job = new_job;
-                        hex2bin(current_job.prevhash_hex, prevhash_le, 32); 
-                        flip32(prevhash_le);
-                        printf("Job changed during mining, switching to: %s\n", current_job.job_id);
-                        goto next_extranonce2; // Break aus Nonce-Loop
+                total_hashes++;
+                
+                // Periodische Checks
+                if(nonce % 1000 == 0){
+                    // Check für neuen Job
+                    stratum_job_t new_job;
+                    if(stratum_get_job_nonblocking(&S, &new_job)){
+                        if(strcmp(current_job.job_id, new_job.job_id) != 0){
+                            current_job = new_job;
+                            hex2bin(current_job.prevhash_hex, prevhash_le, 32); 
+                            flip32(prevhash_le);
+                            printf("New job received: %s\n", current_job.job_id);
+                            goto next_extranonce2;
+                        }
+                    }
+                    
+                    // Hashrate
+                    time_t now = time(NULL);
+                    if(now - last_hashrate >= 10){
+                        double elapsed = difftime(now, last_hashrate);
+                        double hashrate = total_hashes / elapsed;
+                        printf("Hashrate: %.1f H/s | Job: %s | Testing nonce: %08x\r", 
+                               hashrate, current_job.job_id, nonce);
+                        fflush(stdout);
+                        last_hashrate = now;
+                        total_hashes = 0;
                     }
                 }
             }
             
             next_extranonce2:;
-            // bei clean-jobs oder nach Durchlauf aller Nonces weiter mit nächster extranonce2
+            // Weiter mit nächster extranonce2
         }
     }
 
