@@ -144,9 +144,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "clCreateContext failed: %d\n", err);
         return 1;
     }
-    
-    // Modern queue creation (robuster)
-    const cl_queue_properties props[] = { CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0 };
+
+    // ALTE API für Mali Kompatibilität (ohne Profiling)
     cl_command_queue queue = clCreateCommandQueue(ctx, device, 0, &err);
     if (!queue || err) {
         fprintf(stderr, "clCreateCommandQueue failed: %d\n", err);
