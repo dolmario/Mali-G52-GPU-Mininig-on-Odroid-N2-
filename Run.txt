@@ -1,0 +1,2 @@
+RUSTICL_ENABLE=panfrost ./rin_ocl 8   # 8MB test
+RUSTICL_ENABLE=panfrost ./rin_ocl 256 # 256MB production
