@@ -328,11 +328,12 @@ static char* load_kernel_source(const char *path) {
 
 // ================== MAIN ==================
 int main(int argc, char **argv) {
-    // --- Pool-Konfig ---
-    const char *POOL  = "ghostrider.eu.mine.zergpool.com";
-    const int   PORT  = 5354;
-    const char *WAL   = "DTXoRQ7Zpw3FVRW2DWkLrM9Skj4Gp9SeSj";
-    const char *PASS  = "c=DOGE,ID=n2plus";
+    // Pool configuration
+    const char *POOL_HOST = "rinhash.eu.mine.zergpool.com";
+    const int POOL_PORT = 7148;
+    const char *WALLET = "DTXoRQ7Zpw3FVRW2DWkLrM9Skj4Gp9SeSj";
+    const char *PASS   = "c=DOGE,ID=n2plus";
+
 
     // --- OpenCL Setup ---
     uint32_t m_cost_kb = 64*1024; // Default 64MB
