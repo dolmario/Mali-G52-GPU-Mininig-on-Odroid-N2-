@@ -12,6 +12,32 @@
 #include <time.h>
 #include "blake3.h"
 
+
+
+// === Helper: JSON String Extractor ===
+static int get_next_quoted(const char **pp, const char *end, char *out, size_t cap) {
+    const char *p = *pp;
+    const char *q1 = NULL, *q2 = NULL;
+
+    // erstes "
+    for (; p < end; p++) { if (*p == '"') { q1 = p; break; } }
+    if (!q1 || q1 >= end) return 0;
+
+    // zweites "
+    for (p = q1 + 1; p < end; p++) { if (*p == '"') { q2 = p; break; } }
+    if (!q2 || q2 > end) return 0;
+
+    size_t L = (size_t)(q2 - (q1 + 1));
+    if (L >= cap) L = cap - 1;
+    memcpy(out, q1 + 1, L);
+    out[L] = 0;
+
+    *pp = q2 + 1;  // weiter hinter dem String
+    return 1;
+}
+
+
+
 // ---------- Stratum + Job Strukturen ----------
 typedef struct {
     char host[256];
