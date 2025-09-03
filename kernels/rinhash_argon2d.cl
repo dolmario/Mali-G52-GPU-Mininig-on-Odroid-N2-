@@ -1,4 +1,4 @@
-// OpenCL 1.2 RinHash Argon2d Core
+// OpenCL 1.2 RinHash Argon2d Core (Debug Version)
 #define ARGON2_QWORDS_IN_BLOCK 128
 
 inline ulong rotr64(ulong x, uint n) {
@@ -12,8 +12,7 @@ inline void G(ulong *a, ulong *b, ulong *c, ulong *d) {
     *c = *c + *d; *b = rotr64(*b ^ *c, 63);
 }
 
-// Blake2 round for Argon2
-inline void blake2_round(__global ulong *v) {
+inline void blake2_round(__private ulong *v) {
     G(&v[0], &v[4], &v[8],  &v[12]);
     G(&v[1], &v[5], &v[9],  &v[13]);
     G(&v[2], &v[6], &v[10], &v[14]);
@@ -24,8 +23,6 @@ inline void blake2_round(__global ulong *v) {
     G(&v[3], &v[4], &v[9],  &v[14]);
 }
 
-
-// Simple Argon2d Core
 __kernel void argon2d_core(__global const uchar *prehash32,
                            __global uchar *mem,
                            const uint m_cost_kb,
@@ -55,9 +52,20 @@ __kernel void argon2d_core(__global const uchar *prehash32,
             for (int i = 0; i < ARGON2_QWORDS_IN_BLOCK; i++)
                 curr[i] = prev[i] ^ ((ulong)idx * 0x9e3779b97f4a7c15UL);
 
+            // DEBUG: nur beim ersten Block ausgeben
+            if (pass == 0 && idx == 1) {
+                printf("DEBUG Prehash[0]=%02x\n", prehash32[0]);
+                printf("DEBUG Curr[0]=%llu\n", curr[0]);
+            }
+
+            __private ulong state[16];
+            for (int i = 0; i < 16; i++) state[i] = curr[i];
+
             for (int r = 0; r < 2; r++) // 2 rounds
                 for (int j = 0; j < ARGON2_QWORDS_IN_BLOCK/16; j++)
-                    blake2_round(&curr[j*16]);
+                    blake2_round(&state[0]);
+
+            for (int i = 0; i < 16; i++) curr[i] = state[i];
         }
     }
 
@@ -70,4 +78,5 @@ __kernel void argon2d_core(__global const uchar *prehash32,
     }
     for (int i = 0; i < 32; i++) out32[i] ^= prehash32[i];
 }
+
 
