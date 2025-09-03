@@ -473,9 +473,18 @@ int main(int argc, char **argv) {
     }
 }
 
-// === Cleanup (normal nicht erreicht) ===
-clReleaseMemObject(d_mem); clReleaseMemObject(d_phash); clReleaseMemObject(d_out);
-clReleaseKernel(krn); clReleaseProgram(prog);
-clReleaseCommandQueue(q); clReleaseContext(ctx);
-free(ksrc); close(S.sock);
-return 0;
+        }
+    }
+
+    // === Cleanup (normal nicht erreicht) ===
+    clReleaseMemObject(d_mem);
+    clReleaseMemObject(d_phash);
+    clReleaseMemObject(d_out);
+    clReleaseKernel(krn);
+    clReleaseProgram(prog);
+    clReleaseCommandQueue(q);
+    clReleaseContext(ctx);
+    free(ksrc);
+    close(S.sock);
+    return 0;
+}  
