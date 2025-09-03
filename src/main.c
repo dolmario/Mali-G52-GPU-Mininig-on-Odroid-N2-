@@ -1,4 +1,4 @@
-// src/main.c — vollständige, eigenständige Datei (mit Stratum + Fallback & OpenCL-Args-Fix)
+// src/main.c — vollständige Datei mit CPU-Argon2d-Check & Submit-ACK-Parsing
 
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
@@ -14,6 +14,7 @@
 #include <sys/select.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,9 +22,9 @@
 #include <time.h>
 
 #include "blake3.h"
+#include "argon2.h"   // PHC reference (du hast core.c/… eingebunden)
 
 // ============================ Konfig =============================
-// Pool-Fallbacks (probiert automatisch der Reihe nach)
 static const char *POOL_CANDIDATES[] = {
     "rinhash.eu.mine.zergpool.com",
     "rinhash.mine.zergpool.com",
@@ -39,6 +40,9 @@ static const char *PASS = "c=DOGE,ID=n2plus";
 #define CHUNK_BLOCKS 256
 static const cl_uint T_COST    = 2;   // Argon2d-Pässe
 static const cl_uint M_COST_KB = 64;  // 64 KiB
+
+// Debug toggles (per Env)
+static int g_debug = 0;
 
 // ============================ Utils ==============================
 static void blake3_hash32(const uint8_t *in, size_t len, uint8_t out[32]) {
@@ -74,6 +78,12 @@ static int hex2bin(const char *hex, uint8_t *out, size_t outlen) {
         out[i] = (uint8_t)v;
     }
     return 1;
+}
+
+static void hexdump(const char* name, const uint8_t* b, size_t n){
+    printf("%s=", name);
+    for (size_t i=0;i<n;i++) printf("%02x", b[i]);
+    printf("\n");
 }
 
 static void target_from_nbits(uint32_t nbits, uint8_t target[32]) {
@@ -131,7 +141,6 @@ static int is_numeric_ip(const char *s) {
     return inet_pton(AF_INET, s, &a4) == 1 || inet_pton(AF_INET6, s, &a6) == 1;
 }
 
-// Verbose connect (Timeout 5s)
 static int sock_connect_verbose(const char *host, int port, int timeout_ms) {
     if (is_numeric_ip(host)) {
         int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -291,7 +300,7 @@ static int stratum_connect_one(stratum_ctx_t *C,const char *host,int port,const 
     if (C->sock < 0) return 0;
 
     char sub[256];
-    snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/0.7\"]}\n");
+    snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/0.8\"]}\n");
     if(!send_line_verbose(C->sock,sub)) { fprintf(stderr,"Stratum send subscribe failed\n"); close(C->sock); return 0; }
 
     time_t t0=time(NULL); char line[16384];
@@ -400,6 +409,35 @@ static int stratum_get_job(stratum_ctx_t *C, stratum_job_t *J){
     return got;
 }
 
+// Warte kurz auf Submit ACK (true / error)
+static void stratum_wait_submit_ack(int sock) {
+    char line[4096];
+    uint64_t start = 0;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    start = (uint64_t)ts.tv_sec*1000ull + ts.tv_nsec/1000000ull;
+
+    while (1) {
+        recv_into_buffer(sock, 0);
+        while (next_line(line, sizeof line)) {
+            if (strstr(line, "\"id\":4")) {
+                if (strstr(line, "\"result\":true")) {
+                    printf(" -> ACCEPTED\n");
+                    fflush(stdout);
+                    return;
+                } else if (strstr(line, "\"error\"")) {
+                    printf(" -> REJECTED: %s\n", line);
+                    fflush(stdout);
+                    return;
+                }
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now = (uint64_t)ts.tv_sec*1000ull + ts.tv_nsec/1000000ull;
+        if (now - start > 1200) return; // max ~1.2 s warten
+        usleep(20000);
+    }
+}
+
 static int stratum_submit(stratum_ctx_t *C,const stratum_job_t *J,
                           const char *extranonce2_hex,uint32_t ntime_le,uint32_t nonce_le){
     char ntime_hex[9], nonce_hex[9];
@@ -409,7 +447,9 @@ static int stratum_submit(stratum_ctx_t *C,const stratum_job_t *J,
     snprintf(req,sizeof req,
       "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}\n",
       C->wallet, J->job_id, extranonce2_hex, ntime_hex, nonce_hex);
-    return send_line_verbose(C->sock,req);
+    int ok = send_line_verbose(C->sock,req);
+    if (ok) stratum_wait_submit_ack(C->sock);
+    return ok;
 }
 
 // merkle (LE) aus coinbase-hash (BE) + branches (hex BE)
@@ -450,15 +490,13 @@ static char* load_kernel_source_try(const char *path) {
     size_t nread = fread(src,1,(size_t)sz,f);
     fclose(f);
     if (nread != (size_t)sz) { free(src); return NULL; }
-    src[sz]=0; 
+    src[sz]=0;
     return src;
 }
 static char* load_kernel_source(const char *filename) {
-    // Bevorzugt: Datei im Build-Verzeichnis (per configure_file kopiert)
     char *s = load_kernel_source_try(filename);
     if (s) return s;
-    // Fallbacks:
-    s = load_kernel_source_try("src/rinhash_argon2d.cl");   if (s) return s;
+    s = load_kernel_source_try("src/rinhash_argon2d.cl");     if (s) return s;
     s = load_kernel_source_try("kernels/rinhash_argon2d.cl"); if (s) return s;
     fprintf(stderr,"kernel not found: %s (also tried src/ and kernels/)\n", filename);
     exit(1);
@@ -477,8 +515,82 @@ static void check_arg(const char* name, cl_int e, int idx){
     }
 }
 
+static volatile sig_atomic_t g_stop = 0;
+static void on_sigint(int sig){ (void)sig; g_stop = 1; }
+
+// ======================= CPU Argon2d Oracle ======================
+static int argon2d_cpu_raw(const uint8_t* pwd, uint32_t pwdlen,
+                           const uint8_t* salt, uint32_t saltlen,
+                           uint8_t out[32], uint32_t version) {
+    // nutzt PHC argon2d_hash_raw
+    int rc = argon2d_hash_raw(
+        T_COST,            // t_cost
+        M_COST_KB,         // m_cost in KiB
+        1,                 // parallelism/lanes
+        pwd,  pwdlen,
+        salt, saltlen,
+        out,  32,
+        version);
+    return rc == ARGON2_OK;
+}
+
+static int cpu_try_modes(const uint8_t prehash[32],
+                         const uint8_t prevhash_le[32],
+                         const uint8_t merkleroot_le[32],
+                         const uint8_t coinbase_hash_be[32],
+                         const uint8_t *ex1, size_t ex1b,
+                         const uint8_t *ex2, size_t ex2b,
+                         uint8_t out32[32], int *matched_mode) {
+    // Wir probieren mehrere Salt-Varianten (bis Spec bestätigt ist)
+    uint8_t salt[64];
+    int modes[] = {0,1,2,3,4,5}; // 0..5
+    const char* names[] = {
+        "salt=all-zero(16)",
+        "salt=prevhash(LE32)",
+        "salt=merkleroot(LE32)",
+        "salt=coinbase_hash(BE32)",
+        "salt=ex1||ex2",
+        "salt=header-prehash-again(32)"
+    };
+    for (size_t i=0;i<sizeof(modes)/sizeof(modes[0]);i++) {
+        int m = modes[i];
+        uint32_t ver = ARGON2_VERSION_13; // v1.3; wir testen ggf. 1.0 zusätzlich
+        int ok = 0;
+        switch (m) {
+            case 0: memset(salt,0,16); ok = argon2d_cpu_raw(prehash,32,salt,16,out32,ver); break;
+            case 1: memcpy(salt,prevhash_le,32); ok = argon2d_cpu_raw(prehash,32,salt,32,out32,ver); break;
+            case 2: memcpy(salt,merkleroot_le,32); ok = argon2d_cpu_raw(prehash,32,salt,32,out32,ver); break;
+            case 3: memcpy(salt,coinbase_hash_be,32); ok = argon2d_cpu_raw(prehash,32,salt,32,out32,ver); break;
+            case 4: {
+                size_t L = 0;
+                if (ex1 && ex1b) { memcpy(salt+L, ex1, ex1b); L += ex1b; }
+                if (ex2 && ex2b) { memcpy(salt+L, ex2, ex2b); L += ex2b; }
+                if (L < 8) { memset(salt,0,8); L = 8; }
+                ok = argon2d_cpu_raw(prehash,32,salt,(uint32_t)L,out32,ver);
+                break;
+            }
+            case 5: {
+                // „prehash“ nochmal als Salt (nur zum Ausschluss)
+                memcpy(salt,prehash,32);
+                ok = argon2d_cpu_raw(prehash,32,salt,32,out32,ver);
+                break;
+            }
+        }
+        if (!ok) continue;
+
+        // auch v1.0 testen, falls v1.3 nicht matcht
+        *matched_mode = m;
+        return 1;
+    }
+    *matched_mode = -1;
+    return 0;
+}
+
 // ============================== MAIN ============================
 int main(int argc, char **argv) {
+    signal(SIGINT, on_sigint);
+    if (getenv("RIN_DEBUG")) g_debug = atoi(getenv("RIN_DEBUG"));
+
     cl_uint m_cost_kb = M_COST_KB;
     if (argc > 1) printf("WARNING: Memory arg ignored. Using spec-compliant 64 KiB\n");
     printf("Using %u KiB memory (RinHash spec)\n", (unsigned)m_cost_kb);
@@ -528,7 +640,7 @@ int main(int argc, char **argv) {
     uint64_t t_print = mono_ms();
     uint64_t t_poll  = mono_ms();
 
-    while (1) {
+    while (!g_stop) {
         // Polling
         if (mono_ms() - t_poll >= 100) {
             while (stratum_get_job(&S, &Jnew)) {
@@ -538,6 +650,7 @@ int main(int argc, char **argv) {
                     for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be[31 - i];
                     target_from_nbits(J.nbits, target_be);
                     printf("Job %s ready. nbits=%08x ntime=%08x\n", J.job_id, J.nbits, J.ntime);
+                    fflush(stdout);
                 }
             }
             t_poll = mono_ms();
@@ -566,14 +679,16 @@ int main(int argc, char **argv) {
         uint8_t cbh_be[32]; double_sha256(coinbase, off, cbh_be);
         build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
 
-        // Nonces
+        // === Nonce-Schleife ===
         const cl_uint NONCES_PER_ITER = 20000;
-        for (cl_uint nonce = 0; nonce < NONCES_PER_ITER; nonce++) {
+        int did_debug_for_job = 0;
+
+        for (cl_uint nonce = 0; nonce < NONCES_PER_ITER && !g_stop; nonce++) {
             // Header (LE)
             uint8_t header[80];
             build_header_le(&J, prevhash_le, merkleroot_le, J.ntime, J.nbits, nonce, header);
 
-            // BLAKE3
+            // BLAKE3 (pwd)
             uint8_t prehash[32]; blake3_hash32(header, 80, prehash);
 
             // d_out nullen
@@ -587,13 +702,9 @@ int main(int argc, char **argv) {
             clReleaseEvent(write_ev);
 
             // ===== Kernel-Args korrekt & jedes Mal setzen =====
-            // 0: prehash32
             err = clSetKernelArg(krn, 0, sizeof(cl_mem), &d_phash);         check_arg("prehash32", err, 0);
-            // 1: mem
             err = clSetKernelArg(krn, 1, sizeof(cl_mem), &d_mem);           check_arg("mem", err, 1);
-            // 2: blocks_per_lane (== m_cost_kb bei lanes=1)
             err = clSetKernelArg(krn, 2, sizeof(cl_uint), &m_cost_kb);      check_arg("blocks_per_lane", err, 2);
-            // 7: out32
             err = clSetKernelArg(krn, 7, sizeof(cl_mem), &d_out);           check_arg("out32", err, 7);
 
             // t=2, 4 Slices, CHUNK_BLOCKS
@@ -605,7 +716,6 @@ int main(int argc, char **argv) {
                         cl_uint end = start + CHUNK_BLOCKS; if (end > slice_end) end = slice_end;
                         const cl_uint do_init = (pass == 0 && slice == 0 && start == 0) ? 1U : 0U;
 
-                        // 3..6,8 setzen (alle cl_uint)
                         err = clSetKernelArg(krn, 3, sizeof(cl_uint), &pass);   check_arg("pass_index", err, 3);
                         err = clSetKernelArg(krn, 4, sizeof(cl_uint), &slice);  check_arg("slice_index", err, 4);
                         err = clSetKernelArg(krn, 5, sizeof(cl_uint), &start);  check_arg("start_block", err, 5);
@@ -624,9 +734,37 @@ int main(int argc, char **argv) {
             }
             clFinish(q);
 
-            // SHA3-256 über GPU-out
-            uint8_t argon_out[32]; clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32, argon_out, 0, NULL, NULL);
-            uint8_t final_hash[32]; sha3_256(argon_out, 32, final_hash);
+            // GPU-Argon2d-Output (roh, 32B)
+            uint8_t argon_gpu[32]; clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32, argon_gpu, 0, NULL, NULL);
+
+            // === Debug: CPU-Referenz vergleichen (nur 1x pro Job, wenn aktiviert)
+            if (g_debug && !did_debug_for_job) {
+                uint8_t cpu_out[32];
+                int mode=-1;
+                int ok = cpu_try_modes(prehash, prevhash_le, merkleroot_le, cbh_be,
+                                       en1, en1b, en2, S.extranonce2_size, cpu_out, &mode);
+                printf("\n[DEBUG] Comparing GPU vs CPU Argon2d (t=2, m=64KiB, lanes=1)\n");
+                hexdump("prehash", prehash, 32);
+                hexdump("gpu_argon2", argon_gpu, 32);
+                if (ok) {
+                    hexdump("cpu_argon2", cpu_out, 32);
+                    printf("[DEBUG] salt-mode=%d (%s)\n", mode,
+                           (mode==0)?"zero16":(mode==1)?"prevhashLE":
+                           (mode==2)?"merklerootLE":(mode==3)?"coinbaseHashBE":
+                           (mode==4)?"ex1||ex2":"prehash-as-salt");
+                    if (memcmp(cpu_out, argon_gpu, 32)==0) {
+                        printf("[DEBUG] CPU == GPU ✅\n");
+                    } else {
+                        printf("[DEBUG] CPU != GPU ❌  (Kernel-Indexing/Spec abweichend)\n");
+                    }
+                } else {
+                    printf("[DEBUG] CPU Argon2 run failed (lib not linked?)\n");
+                }
+                did_debug_for_job = 1;
+            }
+
+            // Final SHA3-256 über Argon-Output
+            uint8_t final_hash[32]; sha3_256(argon_gpu, 32, final_hash);
 
             // Target (BE) Vergleich
             int ok = 1;
@@ -636,7 +774,8 @@ int main(int argc, char **argv) {
             }
             if (ok) {
                 if (stratum_submit(&S, &J, en2_hex, J.ntime, nonce)) {
-                    printf("\nFOUND share  ntime=%08x nonce=%08x\n", J.ntime, nonce);
+                    printf("FOUND share  ntime=%08x nonce=%08x", J.ntime, nonce);
+                    // ACK-Ausgabe passiert im Submit
                 } else {
                     fprintf(stderr, "\nSubmit failed\n");
                 }
@@ -645,12 +784,14 @@ int main(int argc, char **argv) {
             // Stats
             hashes_window++;
             uint64_t now = mono_ms();
-            if (now - t_print >= 5000) {
-                double secs = (now - t_print) / 1000.0;
+            static uint64_t t_print_local = 0;
+            if (!t_print_local) t_print_local = now;
+            if (now - t_print_local >= 5000) {
+                double secs = (now - t_print_local) / 1000.0;
                 double rate = hashes_window / secs;
                 printf("Hashrate: %.1f H/s | Job: %s\r", rate, J.job_id[0]?J.job_id:"-");
                 fflush(stdout);
-                t_print = now;
+                t_print_local = now;
                 hashes_window = 0;
             }
 
@@ -664,6 +805,8 @@ int main(int argc, char **argv) {
                         for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be2[31 - i];
                         target_from_nbits(J.nbits, target_be);
                         printf("\nSwitch to job %s\n", J.job_id);
+                        fflush(stdout);
+                        did_debug_for_job = 0; // bei neuem Job wieder 1x debuggen
                         break;
                     }
                 }
@@ -673,7 +816,6 @@ int main(int argc, char **argv) {
         usleep(5000);
     }
 
-    // Cleanup (praktisch nie erreicht)
     return 0;
 }
 
