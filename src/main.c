@@ -449,7 +449,7 @@ int main(int argc, char **argv) {
 
         hashes++;
 
-        // --- Stats & neue Jobs ---
+                // --- Stats & neue Jobs ---
         if ((nonce % 1000) == 0) {
             stratum_job_t tmp;
             if (stratum_get_job(&S, &tmp)) {
@@ -471,10 +471,6 @@ int main(int argc, char **argv) {
             }
         }
     }
-}
-
-        }
-    }
 
     // === Cleanup (normal nicht erreicht) ===
     clReleaseMemObject(d_mem);
@@ -486,5 +482,6 @@ int main(int argc, char **argv) {
     clReleaseContext(ctx);
     free(ksrc);
     close(S.sock);
+
     return 0;
-}  
+}
