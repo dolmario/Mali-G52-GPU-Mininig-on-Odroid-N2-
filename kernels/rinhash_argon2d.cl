@@ -12,7 +12,8 @@ inline void G(ulong *a, ulong *b, ulong *c, ulong *d) {
     *c = *c + *d; *b = rotr64(*b ^ *c, 63);
 }
 
-inline void blake2_round(__private ulong *v) {
+// Blake2 round for Argon2
+inline void blake2_round(__global ulong *v) {
     G(&v[0], &v[4], &v[8],  &v[12]);
     G(&v[1], &v[5], &v[9],  &v[13]);
     G(&v[2], &v[6], &v[10], &v[14]);
@@ -22,6 +23,7 @@ inline void blake2_round(__private ulong *v) {
     G(&v[2], &v[7], &v[8],  &v[13]);
     G(&v[3], &v[4], &v[9],  &v[14]);
 }
+
 
 // Simple Argon2d Core
 __kernel void argon2d_core(__global const uchar *prehash32,
