@@ -24,8 +24,8 @@ static const char *WAL  = "DTXoRQ7Zpw3FVRW2DWkLrM9Skj4Gp9SeSj";
 static const char *PASS = "c=DOGE,ID=n2plus";
 
 // Chunk-Größe in Blöcken (1 Block = 1 KB)
-// 2048 ist ein guter Start für Mali, 4096 probieren wenn stabil.
-#define CHUNK_BLOCKS 2048
+// 512 ist konservativ für Mali, später 1024/2048 probieren wenn stabil.
+#define CHUNK_BLOCKS 512   // kleiner für Mali-Timeout/Watchdog
 static const uint32_t T_COST = 2;    // Argon2d-Pässe (RinHash nutzt i.d.R. 2)
 
 // ============================ Utils ==============================
@@ -98,8 +98,8 @@ typedef struct {
 typedef struct {
     char     job_id[128];
     char     prevhash_hex[65];      // BE hex
-    char     coinb1_hex[2048];
-    char     coinb2_hex[2048];
+    char     coinb1_hex[4096];
+    char     coinb2_hex[4096];
     char     merkle_hex[16][65];
     int      merkle_count;
     uint32_t version;
@@ -135,19 +135,32 @@ static int send_line(int s, const char *line) {
     return 1;
 }
 
-static int recv_line_nonblocking(int s, char *buf, size_t cap, int timeout_ms) {
+// -------- robuster Zeilenpuffer --------
+static char inbuf[32768];
+static size_t inlen = 0;
+
+static int recv_into_buffer(int s, int timeout_ms) {
     fd_set rfds; struct timeval tv;
     FD_ZERO(&rfds); FD_SET(s, &rfds);
     tv.tv_sec = timeout_ms/1000; tv.tv_usec = (timeout_ms%1000)*1000;
     int sel = select(s+1,&rfds,NULL,NULL,&tv);
     if (sel <= 0) return 0;
-    size_t o=0;
-    while (o+1<cap) {
-        char c; ssize_t n = recv(s,&c,1,MSG_DONTWAIT);
-        if (n <= 0) break;
-        buf[o++] = c; if (c=='\n') break;
+    char tmp[4096];
+    ssize_t n = recv(s,tmp,sizeof tmp,MSG_DONTWAIT);
+    if (n <= 0) return 0;
+    if (inlen + (size_t)n >= sizeof inbuf) inlen = 0; // Reset bei Überlauf
+    memcpy(inbuf + inlen, tmp, (size_t)n); inlen += (size_t)n;
+    return 1;
+}
+static int next_line(char *out, size_t cap) {
+    for (size_t i=0;i<inlen;i++) if (inbuf[i]=='\n') {
+        size_t L = i+1; if (L >= cap) L = cap-1;
+        memcpy(out, inbuf, L); out[L]=0;
+        memmove(inbuf, inbuf+i+1, inlen-(i+1));
+        inlen -= (i+1);
+        return 1;
     }
-    buf[o]=0; return (int)o;
+    return 0;
 }
 
 static int get_next_quoted(const char *pp, const char *end, char *out, size_t cap) {
@@ -158,6 +171,19 @@ static int get_next_quoted(const char *pp, const char *end, char *out, size_t ca
     if (!q2) return 0;
     size_t L=(size_t)(q2-(q1+1)); if (L>=cap) L=cap-1;
     memcpy(out,q1+1,L); out[L]=0; return 1;
+}
+static int get_nth_quoted(const char *pp, const char *end, int n, char *out, size_t cap){
+    const char *p = pp; int k=0;
+    while (p<end && k<=n) {
+        const char *q1 = strchr(p,'"'); if(!q1||q1>=end) return 0;
+        const char *q2 = strchr(q1+1,'"'); if(!q2||q2>=end) return 0;
+        if (k==n) {
+            size_t L=(size_t)(q2-(q1+1)); if(L>=cap) L=cap-1;
+            memcpy(out,q1+1,L); out[L]=0; return 1;
+        }
+        p = q2+1; k++;
+    }
+    return 0;
 }
 
 static int stratum_parse_notify(const char *line, stratum_job_t *J){
@@ -196,6 +222,26 @@ static int stratum_parse_notify(const char *line, stratum_job_t *J){
     return 1;
 }
 
+static void stratum_parse_subscribe_result(const char *line, char *ex1, size_t ex1cap, uint32_t *ex2sz) {
+    // Sehr simpel: nimm die zweite gequotete Zeichenkette als extranonce1 und
+    // die letzte Ganzzahl in der result-Liste als extranonce2_size.
+    const char *res = strstr(line,"\"result\"");
+    if(!res) return;
+    const char *lb = strchr(res,'['); const char *rb = lb?strchr(lb,']'):NULL;
+    if(!lb || !rb) return;
+    char tmp[256];
+    if (get_nth_quoted(lb,rb,1,tmp,sizeof tmp)) snprintf(ex1,ex1cap,"%s",tmp);
+    // letzte Zahl suchen
+    const char *p = rb-1; while (p>lb && (*p<'0'||*p>'9')) p--;
+    const char *q = p; while (q>lb && *(q-1)>='0' && *(q-1)<='9') q--;
+    if (q>=lb && p>=q) {
+        char num[32]; size_t L=(size_t)(p-q+1); if (L>31) L=31;
+        memcpy(num,q,L); num[L]=0;
+        unsigned long v = strtoul(num,NULL,10);
+        if (v>0 && v<=16) *ex2sz = (uint32_t)v;
+    }
+}
+
 static int stratum_connect(stratum_ctx_t *C,const char *host,int port,const char *user,const char *pass){
     memset(C,0,sizeof *C);
     snprintf(C->host,sizeof C->host,"%s",host); C->port=port;
@@ -204,40 +250,32 @@ static int stratum_connect(stratum_ctx_t *C,const char *host,int port,const char
     C->sock = sock_connect(host,port); if (C->sock<0) return 0;
 
     char sub[256];
-    snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/0.2\"]}\n");
+    snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/0.3\"]}\n");
     if(!send_line(C->sock,sub)) return 0;
 
-    // warte auf result mit extranonce
-    char line[8192]; int ok=0;
-    for (int i=0;i<50;i++){
-        int n = recv_line_nonblocking(C->sock,line,sizeof line,100);
-        if (n>0 && strstr(line,"\"result\"")) { ok=1; break; }
-        usleep(100000);
+    // Warte auf subscribe result (ignoriere method-Messages in der Zeit)
+    time_t t0=time(NULL); char line[8192];
+    while (time(NULL)-t0 < 5) {
+        recv_into_buffer(C->sock, 500);
+        while (next_line(line,sizeof line)) {
+            if (strstr(line,"\"result\"") && !strstr(line,"\"method\"")) {
+                // subscribe result
+                stratum_parse_subscribe_result(line, C->extranonce1, sizeof C->extranonce1, &C->extranonce2_size);
+            }
+            if (C->extranonce1[0] && C->extranonce2_size) goto have_extranonce;
+        }
     }
-    if (!ok) return 0;
-
-    // sehr einfache Extraktion: letztes Zahlenfeld = extranonce2_size
-    const char *lb=strchr(line,'['); const char *rb=lb?strrchr(line,']'):NULL;
-    if(lb&&rb){
-        // extranonce1 (zweites Quoted)
-        const char *p=lb+1; char dummy[256];
-        get_next_quoted(p,rb,dummy,sizeof dummy);        // sub_details
-        get_next_quoted(p,rb,C->extranonce1,sizeof C->extranonce1);
-        const char *lc=strrchr(lb,',');
-        C->extranonce2_size = lc ? (uint32_t)strtoul(lc+1,NULL,10) : 4;
-        if(C->extranonce2_size==0) C->extranonce2_size=4;
-    }
+have_extranonce:
+    if (!C->extranonce1[0]) snprintf(C->extranonce1,sizeof C->extranonce1,"00000000");
+    if (!C->extranonce2_size) C->extranonce2_size = 4;
 
     char auth[512];
     snprintf(auth,sizeof auth,"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}\n",C->wallet,C->pass);
     if(!send_line(C->sock,auth)) return 0;
 
-    // ack oder erste notify
-    for (int i=0;i<50;i++){
-        int n = recv_line_nonblocking(C->sock,line,sizeof line,100);
-        if (n>0 && (strstr(line,"\"result\":true") || strstr(line,"\"mining.notify\""))) break;
-        usleep(100000);
-    }
+    // Konsumiere erste paar Zeilen (diff/notify)
+    t0=time(NULL);
+    while (time(NULL)-t0 < 3) { recv_into_buffer(C->sock, 200); while(next_line(line,sizeof line)){} }
 
     printf("Connected to %s:%d\nExtranonce1=%s, extranonce2_size=%u\n",
            C->host,C->port,C->extranonce1,C->extranonce2_size);
@@ -245,15 +283,15 @@ static int stratum_connect(stratum_ctx_t *C,const char *host,int port,const char
 }
 
 static int stratum_get_job(stratum_ctx_t *C, stratum_job_t *J){
-    char line[16384];
-    int n = recv_line_nonblocking(C->sock,line,sizeof line,10);
-    if (n>0) {
-        if (stratum_parse_notify(line,J)) {
-            printf("New job: %s (clean=%d)\n", J->job_id, J->clean);
-            return 1;
+    char line[16384]; int got=0;
+    recv_into_buffer(C->sock, 0);
+    while (next_line(line,sizeof line)) {
+        if (strstr(line,"\"mining.notify\"")) {
+            if (stratum_parse_notify(line,J)) { got=1; break; }
         }
+        // andere Methoden ignorieren (set_difficulty etc.)
     }
-    return 0;
+    return got;
 }
 
 static int stratum_submit(stratum_ctx_t *C,const stratum_job_t *J,
@@ -340,7 +378,8 @@ int main(int argc, char **argv) {
     clSetKernelArg(krn,0,sizeof(d_phash), &d_phash);
     clSetKernelArg(krn,1,sizeof(d_mem),   &d_mem);
     clSetKernelArg(krn,2,sizeof(uint32_t),&m_cost_kb);
-    clSetKernelArg(krn,7,sizeof(d_out),   &d_out);  // ACHTUNG: Position korrigiert!
+    clSetKernelArg(krn,7,sizeof(d_out),   &d_out);  // ACHTUNG: Position 7 = output
+    // Arg 3..6 und 8 setzen wir pro Dispatch
 
     // Stratum
     stratum_ctx_t S; if(!stratum_connect(&S,POOL,PORT,WAL,PASS)){ fprintf(stderr,"Stratum connect failed\n"); return 1; }
@@ -352,8 +391,11 @@ int main(int argc, char **argv) {
     time_t last_stat=time(NULL); uint64_t hashes=0;
 
     while (1) {
-        // === Job holen (non-blocking) ===
-        if (stratum_get_job(&S, &Jnew)) {
+        // Netzwerk pumpen
+        recv_into_buffer(S.sock, 20);
+
+        // === Job holen (non-blocking, komplette Zeilen) ===
+        while (stratum_get_job(&S, &Jnew)) {
             J = Jnew; have_job = 1;
             uint8_t prev_be[32];
             hex2bin(J.prevhash_hex, prev_be, 32);
@@ -361,10 +403,10 @@ int main(int argc, char **argv) {
             target_from_nbits(J.nbits, target_be);
             printf("Job %s ready. nbits=%08x ntime=%08x\n", J.job_id, J.nbits, J.ntime);
         }
-        if (!have_job) { usleep(100000); continue; }
+        if (!have_job) { usleep(10000); continue; }
 
         // === Coinbase vorbereiten ===
-        uint8_t coinb1[2048], coinb2[2048];
+        uint8_t coinb1[4096], coinb2[4096];
         size_t cb1 = strlen(J.coinb1_hex) / 2, cb2 = strlen(J.coinb2_hex) / 2;
         hex2bin(J.coinb1_hex, coinb1, cb1);
         hex2bin(J.coinb2_hex, coinb2, cb2);
@@ -380,7 +422,7 @@ int main(int argc, char **argv) {
         uint8_t en2[64]; hex2bin(en2_hex, en2, S.extranonce2_size);
 
         // === coinbase zusammenbauen ===
-        uint8_t coinbase[4096]; size_t off = 0;
+        uint8_t coinbase[8192]; size_t off = 0;
         memcpy(coinbase + off, coinb1, cb1); off += cb1;
         memcpy(coinbase + off, en1, en1b); off += en1b;
         memcpy(coinbase + off, en2, S.extranonce2_size); off += S.extranonce2_size;
@@ -399,12 +441,16 @@ int main(int argc, char **argv) {
             uint8_t header[80];
             build_header_le(&J, prevhash_le, merkleroot_le, J.ntime, J.nbits, nonce, header);
 
-            // BLAKE3
+            // BLAKE3 -> prehash32
             uint8_t prehash[32]; blake3_hash32(header, 80, prehash);
-            clEnqueueWriteBuffer(q, d_phash, CL_TRUE, 0, 32, prehash, 0, NULL, NULL);
 
-            // Argon2d
-            size_t G = 1;
+            // Asynchron schreiben, nur auf diesen Transfer warten
+            cl_event write_ev;
+            clEnqueueWriteBuffer(q, d_phash, CL_FALSE, 0, 32, prehash, 0, NULL, &write_ev);
+            clWaitForEvents(1, &write_ev);
+            clReleaseEvent(write_ev);
+
+            // Argon2d: pass/slice/chunks
             for (uint32_t pass = 0; pass < T_COST; pass++) {
                 for (uint32_t slice = 0; slice < 4; slice++) {
                     const uint32_t slice_begin = slice * (m_cost_kb / 4);
@@ -420,19 +466,22 @@ int main(int argc, char **argv) {
                         clSetKernelArg(krn, 6, sizeof(uint32_t), &end);
                         clSetKernelArg(krn, 8, sizeof(uint32_t), &do_init);
 
+                        // WICHTIG: G = end - start  (ein Work-Item pro Block)
+                        size_t G = (size_t)(end - start);
                         err = clEnqueueNDRangeKernel(q, krn, 1, NULL, &G, NULL, 0, NULL, NULL);
                         if (err != CL_SUCCESS) { fprintf(stderr, "Kernel failed: %d\n", err); break; }
                         clFlush(q);
                     }
                 }
             }
+            // Synchronisation erst NACH allen Chunks/Pass/Slice
             clFinish(q);
 
-            // SHA3-256
+            // SHA3-256 over GPU-out
             uint8_t argon_out[32]; clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32, argon_out, 0, NULL, NULL);
             uint8_t final_hash[32]; sha3_256(argon_out, 32, final_hash);
 
-            // Target-Vergleich
+            // Target-Vergleich (BE)
             int ok = 1;
             for (int i = 0; i < 32; i++) {
                 if (final_hash[i] < target_be[i]) { ok = 1; break; }
@@ -448,19 +497,27 @@ int main(int argc, char **argv) {
 
             hashes++;
 
-            // Stats & neue Jobs
+            // Stats & neue Jobs (ge-drosselt)
             if ((nonce % 1000) == 0) {
-                stratum_job_t tmp;
-                if (stratum_get_job(&S, &tmp)) {
-                    if (strcmp(tmp.job_id, J.job_id) != 0 || tmp.clean) {
-                        J = tmp;
-                        uint8_t prev_be2[32]; hex2bin(J.prevhash_hex, prev_be2, 32);
-                        for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be2[31 - i];
-                        target_from_nbits(J.nbits, target_be);
-                        printf("\nSwitch to job %s\n", J.job_id);
-                        break;
+                static struct timespec last_poll = {0, 0};
+                struct timespec nowts;
+                clock_gettime(CLOCK_MONOTONIC, &nowts);
+                long diff_ms = (nowts.tv_sec - last_poll.tv_sec) * 1000L
+                             + (nowts.tv_nsec - last_poll.tv_nsec) / 1000000L;
+                if (diff_ms >= 100) {
+                    while (stratum_get_job(&S, &Jnew)) {
+                        if (strcmp(Jnew.job_id, J.job_id) != 0 || Jnew.clean) {
+                            J = Jnew;
+                            uint8_t prev_be2[32]; hex2bin(J.prevhash_hex, prev_be2, 32);
+                            for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be2[31 - i];
+                            target_from_nbits(J.nbits, target_be);
+                            printf("\nSwitch to job %s\n", J.job_id);
+                            break;
+                        }
                     }
+                    last_poll = nowts;
                 }
+
                 time_t now = time(NULL);
                 if (now - last_stat >= 10) {
                     double rate = (double)hashes / (double)(now - last_stat);
