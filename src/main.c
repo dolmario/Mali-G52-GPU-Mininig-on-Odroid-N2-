@@ -1,9 +1,14 @@
+// src/main.c — vollständige, eigenständige Datei (mit Stratum + Fallback & OpenCL-Args-Fix)
+
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <stdint.h>
 #include <pthread.h>
 #include <sys/select.h>
@@ -18,16 +23,22 @@
 #include "blake3.h"
 
 // ============================ Konfig =============================
-// Pool / Login
-static const char *POOL = "rinhash.eu.mine.zergpool.com";
-static const int   PORT = 7148;
+// Pool-Fallbacks (probiert automatisch der Reihe nach)
+static const char *POOL_CANDIDATES[] = {
+    "rinhash.eu.mine.zergpool.com",
+    "rinhash.mine.zergpool.com",
+    "rinhash.na.mine.zergpool.com",
+    "rinhash.asia.mine.zergpool.com",
+    NULL
+};
+static const int   PORT_DEFAULT = 7148;
 static const char *WAL  = "DTXoRQ7Zpw3FVRW2DWkLrM9Skj4Gp9SeSj";
 static const char *PASS = "c=DOGE,ID=n2plus";
 
-// RinHash-Parameter (FIX)
-#define CHUNK_BLOCKS 256           // konservativ für Mali-Timeout/Watchdog
-static const uint32_t T_COST    = 2;   // Argon2d-Pässe
-static const uint32_t M_COST_KB = 64;  // **64 KiB**, NICHT MB!
+// RinHash-Parameter (Spec-konform)
+#define CHUNK_BLOCKS 256
+static const cl_uint T_COST    = 2;   // Argon2d-Pässe
+static const cl_uint M_COST_KB = 64;  // 64 KiB
 
 // ============================ Utils ==============================
 static void blake3_hash32(const uint8_t *in, size_t len, uint8_t out[32]) {
@@ -92,7 +103,7 @@ typedef struct {
     char wallet[128];
     char pass[128];
     char extranonce1[64];
-    uint32_t extranonce2_size;
+    cl_uint extranonce2_size;
 } stratum_ctx_t;
 
 typedef struct {
@@ -108,30 +119,107 @@ typedef struct {
     int      clean;
 } stratum_job_t;
 
-static int sock_connect(const char *host, int port) {
-    struct addrinfo hints = {0}, *res=NULL,*p=NULL; 
-    char portstr[16];
-    snprintf(portstr,sizeof portstr,"%d",port);
-    hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
-    if (getaddrinfo(host,portstr,&hints,&res)!=0) return -1;
-    int s=-1;
-    for (p=res;p;p=p->ai_next) {
-        s = socket(p->ai_family,p->ai_socktype,p->ai_protocol);
-        if (s<0) continue;
-        if (connect(s,p->ai_addr,p->ai_addrlen)==0) break;
-        close(s); s=-1;
+static int set_nonblock(int s, int on) {
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (on) flags |= O_NONBLOCK; else flags &= ~O_NONBLOCK;
+    return fcntl(s, F_SETFL, flags);
+}
+
+static int is_numeric_ip(const char *s) {
+    struct in6_addr a6; struct in_addr a4;
+    return inet_pton(AF_INET, s, &a4) == 1 || inet_pton(AF_INET6, s, &a6) == 1;
+}
+
+// Verbose connect (Timeout 5s)
+static int sock_connect_verbose(const char *host, int port, int timeout_ms) {
+    if (is_numeric_ip(host)) {
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0) { perror("socket"); return -1; }
+        struct sockaddr_in sa; memset(&sa,0,sizeof sa);
+        sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);
+        if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) { close(s); return -1; }
+        if (set_nonblock(s, 1) != 0) { perror("fcntl(O_NONBLOCK)"); close(s); return -1; }
+        int rc = connect(s, (struct sockaddr*)&sa, sizeof sa);
+        if (rc != 0 && errno != EINPROGRESS) { perror("connect"); close(s); return -1; }
+        fd_set wfds; FD_ZERO(&wfds); FD_SET(s, &wfds);
+        struct timeval tv = { .tv_sec = timeout_ms/1000, .tv_usec = (timeout_ms%1000)*1000 };
+        rc = select(s+1, NULL, &wfds, NULL, &tv);
+        if (rc <= 0) { if (rc==0) fprintf(stderr,"connect timeout %s\n", host); else perror("select"); close(s); return -1; }
+        int soerr=0; socklen_t slen=sizeof soerr;
+        if (getsockopt(s,SOL_SOCKET,SO_ERROR,&soerr,&slen)<0 || soerr!=0){ if(soerr) fprintf(stderr,"connect error: %s\n", strerror(soerr)); else perror("getsockopt"); close(s); return -1; }
+        fprintf(stderr,"Connected to %s (numeric IP)\n", host);
+        return s;
     }
+
+    struct addrinfo hints = {0}, *res=NULL, *p=NULL;
+    char portstr[16];
+    snprintf(portstr, sizeof portstr, "%d", port);
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_flags    = AI_NUMERICSERV | AI_ADDRCONFIG;
+
+    int ga = getaddrinfo(host, portstr, &hints, &res);
+    if (ga != 0 || !res) {
+        fprintf(stderr, "DNS resolve failed for %s:%s - %s\n", host, portstr, gai_strerror(ga));
+        return -1;
+    }
+
+    int s = -1;
+    for (p = res; p; p = p->ai_next) {
+        char addrbuf[128] = {0};
+        void *aptr = NULL;
+        if (p->ai_family == AF_INET)  aptr = &((struct sockaddr_in*)p->ai_addr)->sin_addr;
+        if (p->ai_family == AF_INET6) aptr = &((struct sockaddr_in6*)p->ai_addr)->sin6_addr;
+        if (aptr) inet_ntop(p->ai_family, aptr, addrbuf, sizeof addrbuf);
+
+        s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (s < 0) { perror("socket"); continue; }
+
+        if (set_nonblock(s, 1) != 0) { perror("fcntl(O_NONBLOCK)"); close(s); s=-1; continue; }
+
+        int rc = connect(s, p->ai_addr, p->ai_addrlen);
+        if (rc != 0 && errno != EINPROGRESS) {
+            fprintf(stderr, "connect() to %s (%s) failed: %s\n", host, addrbuf[0]?addrbuf:"?", strerror(errno));
+            close(s); s=-1; continue;
+        }
+        fd_set wfds; FD_ZERO(&wfds); FD_SET(s, &wfds);
+        struct timeval tv = { .tv_sec = timeout_ms/1000, .tv_usec = (timeout_ms%1000)*1000 };
+        rc = select(s+1, NULL, &wfds, NULL, &tv);
+        if (rc <= 0) {
+            if (rc == 0) fprintf(stderr, "connect() timeout to %s (%s)\n", host, addrbuf[0]?addrbuf:"?");
+            else perror("select(connect)");
+            close(s); s = -1; continue;
+        }
+        int soerr=0; socklen_t slen=sizeof soerr;
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0 || soerr != 0) {
+            if (soerr) fprintf(stderr, "connect() error after select to %s (%s): %s\n", host, addrbuf[0]?addrbuf:"?", strerror(soerr));
+            else perror("getsockopt(SO_ERROR)");
+            close(s); s = -1; continue;
+        }
+        fprintf(stderr, "Connected to %s (%s)\n", host, addrbuf[0]?addrbuf:"?");
+        break;
+    }
+
     freeaddrinfo(res);
-    if (s >= 0) {
-        int flags = fcntl(s, F_GETFL, 0);
-        fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    if (s < 0) {
+        fprintf(stderr, "All address candidates for %s:%d failed.\n", host, port);
+        return -1;
     }
     return s;
 }
 
-static int send_line(int s, const char *line) {
-    size_t L=strlen(line),o=0; 
-    while(o<L){ ssize_t n=send(s,line+o,L-o,0); if(n<=0) return 0; o+=n; }
+static int send_line_verbose(int s, const char *line) {
+    size_t L = strlen(line), o = 0;
+    while (o < L) {
+        ssize_t n = send(s, line + o, L - o, 0);
+        if (n <= 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { usleep(1000); continue; }
+            fprintf(stderr, "send() failed: %s\n", strerror(errno));
+            return 0;
+        }
+        o += (size_t)n;
+    }
     return 1;
 }
 
@@ -177,7 +265,7 @@ static const char* find_after_result_array_first(const char *s) {
     }
     return NULL;
 }
-static int parse_subscribe_result(const char *line, char *ex1, size_t ex1cap, uint32_t *ex2sz){
+static int parse_subscribe_result(const char *line, char *ex1, size_t ex1cap, cl_uint *ex2sz){
     const char *after_first = find_after_result_array_first(line);
     if (!after_first) return 0;
     const char *q1 = strchr(after_first, '"'); if(!q1) return 0;
@@ -189,49 +277,69 @@ static int parse_subscribe_result(const char *line, char *ex1, size_t ex1cap, ui
     while (*p && (*p==' ' || *p==',' || *p==']')) p++;
     unsigned long v = strtoul(p, NULL, 10);
     if (v == 0 || v > 32) v = 4;
-    *ex2sz = (uint32_t)v;
+    *ex2sz = (cl_uint)v;
     return 1;
 }
 
-static int stratum_connect(stratum_ctx_t *C,const char *host,int port,const char *user,const char *pass){
+static int stratum_connect_one(stratum_ctx_t *C,const char *host,int port,const char *user,const char *pass){
     memset(C,0,sizeof *C);
     snprintf(C->host,sizeof C->host,"%s",host); C->port=port;
     snprintf(C->wallet,sizeof C->wallet,"%s",user);
     snprintf(C->pass,sizeof C->pass,"%s",pass);
-    C->sock = sock_connect(host,port); if (C->sock<0) return 0;
+
+    C->sock = sock_connect_verbose(host, port, 5000);
+    if (C->sock < 0) return 0;
 
     char sub[256];
     snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/0.7\"]}\n");
-    if(!send_line(C->sock,sub)) return 0;
+    if(!send_line_verbose(C->sock,sub)) { fprintf(stderr,"Stratum send subscribe failed\n"); close(C->sock); return 0; }
 
-    // Warte auf subscribe result; ignoriere method-Zeilen
     time_t t0=time(NULL); char line[16384];
+    int have_ex = 0;
     while (time(NULL)-t0 < 5) {
         recv_into_buffer(C->sock, 500);
         while (next_line(line,sizeof line)) {
             if (strstr(line,"\"result\"") && !strstr(line,"\"method\"")) {
                 if (parse_subscribe_result(line, C->extranonce1, sizeof C->extranonce1, &C->extranonce2_size)) {
-                    goto have_extranonce;
+                    have_ex = 1; break;
                 }
             }
         }
+        if (have_ex) break;
     }
-have_extranonce:
+    if (!have_ex) {
+        fprintf(stderr, "No subscribe result within timeout (5s)\n");
+        close(C->sock); return 0;
+    }
     if (!C->extranonce1[0]) snprintf(C->extranonce1,sizeof C->extranonce1,"00000000");
     if (!C->extranonce2_size) C->extranonce2_size = 4;
 
-    // Authorize
     char auth[512];
     snprintf(auth,sizeof auth,"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}\n",C->wallet,C->pass);
-    if(!send_line(C->sock,auth)) return 0;
+    if(!send_line_verbose(C->sock,auth)) { fprintf(stderr,"Stratum send authorize failed\n"); close(C->sock); return 0; }
 
-    // Erstes Rauschen abholen
     t0=time(NULL);
     while (time(NULL)-t0 < 2) { recv_into_buffer(C->sock, 200); while(next_line(line,sizeof line)){} }
 
     printf("Connected to %s:%d\nExtranonce1=%s, extranonce2_size=%u\n",
-           C->host,C->port,C->extranonce1,C->extranonce2_size);
+           C->host,C->port,C->extranonce1,(unsigned)C->extranonce2_size);
     return 1;
+}
+
+static int stratum_connect_any(stratum_ctx_t *C, const char **hosts, int port, const char *user, const char *pass){
+    const char *env_host = getenv("POOL_HOST");
+    const char *env_port = getenv("POOL_PORT");
+    if (env_host && env_host[0]) {
+        int p = (env_port && env_port[0]) ? atoi(env_port) : port;
+        fprintf(stderr, "Trying POOL_HOST from ENV: %s:%d\n", env_host, p);
+        if (stratum_connect_one(C, env_host, p, user, pass)) return 1;
+        fprintf(stderr, "ENV host failed, falling back to default list…\n");
+    }
+    for (int i = 0; hosts[i]; i++) {
+        fprintf(stderr, "Trying %s:%d …\n", hosts[i], port);
+        if (stratum_connect_one(C, hosts[i], port, user, pass)) return 1;
+    }
+    return 0;
 }
 
 static int get_next_quoted(const char *pp, const char *end, char *out, size_t cap) {
@@ -301,7 +409,7 @@ static int stratum_submit(stratum_ctx_t *C,const stratum_job_t *J,
     snprintf(req,sizeof req,
       "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}\n",
       C->wallet, J->job_id, extranonce2_hex, ntime_hex, nonce_hex);
-    return send_line(C->sock,req);
+    return send_line_verbose(C->sock,req);
 }
 
 // merkle (LE) aus coinbase-hash (BE) + branches (hex BE)
@@ -331,10 +439,29 @@ static void build_header_le(const stratum_job_t *J, const uint8_t prevhash_le[32
 }
 
 // ============================ OpenCL =============================
-static char* load_kernel_source(const char *path) {
-    FILE *f=fopen(path,"rb"); if(!f){ perror("kernel"); exit(1); }
-    fseek(f,0,SEEK_END); long sz=ftell(f); rewind(f);
-    char *src=(char*)malloc(sz+1); fread(src,1,sz,f); src[sz]=0; fclose(f); return src;
+static char* load_kernel_source_try(const char *path) {
+    FILE *f=fopen(path,"rb");
+    if(!f) return NULL;
+    if (fseek(f,0,SEEK_END)!=0){ fclose(f); return NULL; }
+    long sz=ftell(f); if (sz<0){ fclose(f); return NULL; }
+    rewind(f);
+    char *src=(char*)malloc((size_t)sz+1);
+    if(!src){ fclose(f); return NULL; }
+    size_t nread = fread(src,1,(size_t)sz,f);
+    fclose(f);
+    if (nread != (size_t)sz) { free(src); return NULL; }
+    src[sz]=0; 
+    return src;
+}
+static char* load_kernel_source(const char *filename) {
+    // Bevorzugt: Datei im Build-Verzeichnis (per configure_file kopiert)
+    char *s = load_kernel_source_try(filename);
+    if (s) return s;
+    // Fallbacks:
+    s = load_kernel_source_try("src/rinhash_argon2d.cl");   if (s) return s;
+    s = load_kernel_source_try("kernels/rinhash_argon2d.cl"); if (s) return s;
+    fprintf(stderr,"kernel not found: %s (also tried src/ and kernels/)\n", filename);
+    exit(1);
 }
 
 // Monotonic ms
@@ -343,14 +470,18 @@ static inline uint64_t mono_ms(void){
     return (uint64_t)ts.tv_sec*1000ull + (uint64_t)ts.tv_nsec/1000000ull;
 }
 
+static void check_arg(const char* name, cl_int e, int idx){
+    if (e != CL_SUCCESS){
+        fprintf(stderr, "clSetKernelArg(%s, idx=%d) failed: %d\n", name, idx, e);
+        exit(1);
+    }
+}
+
 // ============================== MAIN ============================
 int main(int argc, char **argv) {
-    // RinHash-spezifisch: immer 64 KiB
-    uint32_t m_cost_kb = M_COST_KB;
-    if (argc > 1) {
-        printf("WARNING: Memory arg ignored. Using spec-compliant 64 KiB\n");
-    }
-    printf("Using %u KiB memory (RinHash spec)\n", m_cost_kb);
+    cl_uint m_cost_kb = M_COST_KB;
+    if (argc > 1) printf("WARNING: Memory arg ignored. Using spec-compliant 64 KiB\n");
+    printf("Using %u KiB memory (RinHash spec)\n", (unsigned)m_cost_kb);
 
     // OpenCL Setup
     cl_int err; cl_platform_id plat; cl_device_id dev;
@@ -374,22 +505,21 @@ int main(int argc, char **argv) {
         log[L]=0; fprintf(stderr,"Build failed:\n%s\n",log); free(log); return 1;
     }
     cl_kernel krn = clCreateKernel(prog,"argon2d_core",&err);
+    if (err!=CL_SUCCESS){ fprintf(stderr,"clCreateKernel failed: %d\n", err); return 1; }
 
     // Speicher: 64 KiB
     size_t m_bytes = (size_t)m_cost_kb * 1024;
     cl_mem d_mem   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,m_bytes,NULL,&err);
     cl_mem d_phash = clCreateBuffer(ctx,CL_MEM_READ_ONLY, 32,NULL,&err);
-    cl_mem d_out   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,32,NULL,&err); // RW wegen atomics im Kernel
-
-    // Kernel-Args (statisch)
-    clSetKernelArg(krn,0,sizeof(d_phash), &d_phash);
-    clSetKernelArg(krn,1,sizeof(d_mem),   &d_mem);
-    clSetKernelArg(krn,2,sizeof(uint32_t),&m_cost_kb);
-    clSetKernelArg(krn,7,sizeof(d_out),   &d_out);  // output (32B)
-    // 3..6 und 8 setzen wir pro Dispatch
+    cl_mem d_out   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,32,NULL,&err);
 
     // ===== Stratum =====
-    stratum_ctx_t S; if(!stratum_connect(&S,POOL,PORT,WAL,PASS)){ fprintf(stderr,"Stratum connect failed\n"); return 1; }
+    int         PORT = getenv("POOL_PORT") ? atoi(getenv("POOL_PORT")) : PORT_DEFAULT;
+    stratum_ctx_t S;
+    if(!stratum_connect_any(&S, POOL_CANDIDATES, PORT, WAL, PASS)){
+        fprintf(stderr,"Stratum connect failed (all hosts)\n");
+        return 1;
+    }
 
     uint8_t prevhash_le[32], merkleroot_le[32], target_be[32];
     stratum_job_t J={0}, Jnew={0}; int have_job=0;
@@ -399,8 +529,8 @@ int main(int argc, char **argv) {
     uint64_t t_poll  = mono_ms();
 
     while (1) {
+        // Polling
         if (mono_ms() - t_poll >= 100) {
-            recv_into_buffer(S.sock, 0);
             while (stratum_get_job(&S, &Jnew)) {
                 if (!have_job || strcmp(Jnew.job_id, J.job_id) != 0 || Jnew.clean) {
                     J = Jnew; have_job = 1;
@@ -414,7 +544,7 @@ int main(int argc, char **argv) {
         }
         if (!have_job) { usleep(10000); continue; }
 
-        // === Coinbase vorbereiten ===
+        // Coinbase, Merkle
         uint8_t coinb1[4096], coinb2[4096];
         size_t cb1 = strlen(J.coinb1_hex) / 2, cb2 = strlen(J.coinb2_hex) / 2;
         hex2bin(J.coinb1_hex, coinb1, cb1);
@@ -422,8 +552,7 @@ int main(int argc, char **argv) {
 
         uint8_t en1[64]; size_t en1b = strlen(S.extranonce1) / 2; if (en1b > 64) en1b = 64;
         hex2bin(S.extranonce1, en1, en1b);
-
-        static uint32_t en2_counter = 1;
+        static cl_uint en2_counter = 1;
         char en2_hex[64];
         snprintf(en2_hex, sizeof en2_hex, "%0*x", S.extranonce2_size * 2, en2_counter++);
         uint8_t en2[64]; hex2bin(en2_hex, en2, S.extranonce2_size);
@@ -437,46 +566,58 @@ int main(int argc, char **argv) {
         uint8_t cbh_be[32]; double_sha256(coinbase, off, cbh_be);
         build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
 
-        // === Nonce-Range ===
-        const uint32_t NONCES_PER_ITER = 20000;
-        for (uint32_t nonce = 0; nonce < NONCES_PER_ITER; nonce++) {
+        // Nonces
+        const cl_uint NONCES_PER_ITER = 20000;
+        for (cl_uint nonce = 0; nonce < NONCES_PER_ITER; nonce++) {
             // Header (LE)
             uint8_t header[80];
             build_header_le(&J, prevhash_le, merkleroot_le, J.ntime, J.nbits, nonce, header);
 
-            // BLAKE3 -> prehash32
+            // BLAKE3
             uint8_t prehash[32]; blake3_hash32(header, 80, prehash);
 
-            // d_out nullen (für atomare Reduktion im Kernel)
+            // d_out nullen
             static const uint8_t zero32[32] = {0};
             clEnqueueWriteBuffer(q, d_out, CL_FALSE, 0, 32, zero32, 0, NULL, NULL);
 
-            // Prehash schreiben (nur auf diesen Transfer warten)
+            // Prehash schreiben (Warte nur auf diesen Transfer)
             cl_event write_ev;
             clEnqueueWriteBuffer(q, d_phash, CL_FALSE, 0, 32, prehash, 0, NULL, &write_ev);
             clWaitForEvents(1, &write_ev);
             clReleaseEvent(write_ev);
 
-            // Argon2d: t=2, 4 slices – chunkweise
-            for (uint32_t pass = 0; pass < T_COST; pass++) {
-                for (uint32_t slice = 0; slice < 4; slice++) {
-                    const uint32_t slice_begin = slice * (m_cost_kb / 4);
-                    const uint32_t slice_end   = (slice + 1) * (m_cost_kb / 4);
-                    for (uint32_t start = slice_begin; start < slice_end; start += CHUNK_BLOCKS) {
-                        uint32_t end = start + CHUNK_BLOCKS; if (end > slice_end) end = slice_end;
-                        const uint32_t do_init = (pass == 0 && slice == 0 && start == 0) ? 1U : 0U;
+            // ===== Kernel-Args korrekt & jedes Mal setzen =====
+            // 0: prehash32
+            err = clSetKernelArg(krn, 0, sizeof(cl_mem), &d_phash);         check_arg("prehash32", err, 0);
+            // 1: mem
+            err = clSetKernelArg(krn, 1, sizeof(cl_mem), &d_mem);           check_arg("mem", err, 1);
+            // 2: blocks_per_lane (== m_cost_kb bei lanes=1)
+            err = clSetKernelArg(krn, 2, sizeof(cl_uint), &m_cost_kb);      check_arg("blocks_per_lane", err, 2);
+            // 7: out32
+            err = clSetKernelArg(krn, 7, sizeof(cl_mem), &d_out);           check_arg("out32", err, 7);
 
-                        // Kernel-Args
-                        clSetKernelArg(krn, 3, sizeof(uint32_t), &pass);
-                        clSetKernelArg(krn, 4, sizeof(uint32_t), &slice);
-                        clSetKernelArg(krn, 5, sizeof(uint32_t), &start);
-                        clSetKernelArg(krn, 6, sizeof(uint32_t), &end);
-                        clSetKernelArg(krn, 8, sizeof(uint32_t), &do_init);
+            // t=2, 4 Slices, CHUNK_BLOCKS
+            for (cl_uint pass = 0; pass < T_COST; pass++) {
+                for (cl_uint slice = 0; slice < 4; slice++) {
+                    const cl_uint slice_begin = slice * (m_cost_kb / 4);
+                    const cl_uint slice_end   = (slice + 1) * (m_cost_kb / 4);
+                    for (cl_uint start = slice_begin; start < slice_end; start += CHUNK_BLOCKS) {
+                        cl_uint end = start + CHUNK_BLOCKS; if (end > slice_end) end = slice_end;
+                        const cl_uint do_init = (pass == 0 && slice == 0 && start == 0) ? 1U : 0U;
 
-                        // 1 WI = sequenzieller Chunk (korrekte Reihenfolge / Single-Lane)
+                        // 3..6,8 setzen (alle cl_uint)
+                        err = clSetKernelArg(krn, 3, sizeof(cl_uint), &pass);   check_arg("pass_index", err, 3);
+                        err = clSetKernelArg(krn, 4, sizeof(cl_uint), &slice);  check_arg("slice_index", err, 4);
+                        err = clSetKernelArg(krn, 5, sizeof(cl_uint), &start);  check_arg("start_block", err, 5);
+                        err = clSetKernelArg(krn, 6, sizeof(cl_uint), &end);    check_arg("end_block", err, 6);
+                        err = clSetKernelArg(krn, 8, sizeof(cl_uint), &do_init);check_arg("do_init", err, 8);
+
                         size_t G = 1;
                         err = clEnqueueNDRangeKernel(q, krn, 1, NULL, &G, NULL, 0, NULL, NULL);
-                        if (err != CL_SUCCESS) { fprintf(stderr, "Kernel failed: %d\n", err); break; }
+                        if (err != CL_SUCCESS) {
+                            fprintf(stderr, "clEnqueueNDRangeKernel failed: %d\n", err);
+                            exit(1);
+                        }
                         clFlush(q);
                     }
                 }
@@ -487,7 +628,7 @@ int main(int argc, char **argv) {
             uint8_t argon_out[32]; clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32, argon_out, 0, NULL, NULL);
             uint8_t final_hash[32]; sha3_256(argon_out, 32, final_hash);
 
-            // Target (BE)
+            // Target (BE) Vergleich
             int ok = 1;
             for (int i = 0; i < 32; i++) {
                 if (final_hash[i] < target_be[i]) { ok = 1; break; }
@@ -502,7 +643,6 @@ int main(int argc, char **argv) {
             }
 
             // Stats
-            static uint64_t hashes_window = 0;
             hashes_window++;
             uint64_t now = mono_ms();
             if (now - t_print >= 5000) {
@@ -516,7 +656,6 @@ int main(int argc, char **argv) {
 
             // sanftes Stratum-Polling
             if ((nonce % 1000) == 0 && mono_ms() - t_poll >= 100) {
-                recv_into_buffer(S.sock, 0);
                 stratum_job_t Jtmp;
                 while (stratum_get_job(&S, &Jtmp)) {
                     if (strcmp(Jtmp.job_id, J.job_id) != 0 || Jtmp.clean) {
@@ -530,21 +669,11 @@ int main(int argc, char **argv) {
                 }
                 t_poll = mono_ms();
             }
-        } // for nonce
-
-        // kleine Pause
+        } // nonces
         usleep(5000);
-    } // while (1)
+    }
 
-    // ===== Cleanup =====
-    clReleaseMemObject(d_mem);
-    clReleaseMemObject(d_phash);
-    clReleaseMemObject(d_out);
-    clReleaseKernel(krn);
-    clReleaseProgram(prog);
-    clReleaseCommandQueue(q);
-    clReleaseContext(ctx);
-    free(ksrc);
-    close(S.sock);
+    // Cleanup (praktisch nie erreicht)
     return 0;
 }
+
