@@ -155,58 +155,85 @@ static int stratum_connect(stratum_ctx_t *C, const char *host,int port,const cha
 }
 
 static int stratum_parse_notify(const char *line, stratum_job_t *J){
-    if(!strstr(line,"\"mining.notify\"")) return 0;
-    memset(J,0,sizeof *J);
-    // Params: [job_id, prevhash, coinb1, coinb2, merkle[], version, nbits, ntime, clean]
-    const char *p = strstr(line,"\"params\"");
-    if(!p) return 0;
-    const char *lb = strchr(p,'['); const char *rb = strrchr(p,']'); if(!lb||!rb) return 0;
-    p = lb+1;
+    if (!strstr(line, "\"mining.notify\"")) return 0;
+    memset(J, 0, sizeof(*J));
 
-    // helper to read next quoted string
-    auto get_q = [&](char *out, size_t cap)->int{
-        const char *q1=strchr(p,'\"'); if(!q1||q1>rb) return 0;
-        const char *q2=strchr(q1+1,'\"'); if(!q2||q2>rb) return 0;
-        size_t L=(size_t)(q2-(q1+1)); if(L>=cap) L=cap-1;
-        memcpy(out,q1+1,L); out[L]=0; p=q2+1; return 1;
-    };
+    // params suchen
+    const char *p_params = strstr(line, "\"params\"");
+    if (!p_params) return 0;
+    const char *lb = strchr(p_params, '[');
+    const char *rb = lb ? strrchr(p_params, ']') : NULL;
+    if (!lb || !rb || rb <= lb) return 0;
 
-    if(!get_q(J->job_id,sizeof J->job_id)) return 0;
-    if(!get_q(J->prevhash_hex,sizeof J->prevhash_hex)) return 0;
-    if(!get_q(J->coinb1_hex,sizeof J->coinb1_hex)) return 0;
-    if(!get_q(J->coinb2_hex,sizeof J->coinb2_hex)) return 0;
+    // Lesezeiger innerhalb params
+    const char *p = lb + 1;
 
-    // merkle array
-    J->merkle_count=0;
-    const char *ma = strchr(p,'['); const char *me = strchr(p,']');
-    if(ma && me && ma<me){
-        const char *mp = ma+1;
-        while(J->merkle_count<16){
-            const char *q1=strchr(mp,'\"'); if(!q1||q1>me) break;
-            const char *q2=strchr(q1+1,'\"'); if(!q2||q2>me) break;
-            size_t L=(size_t)(q2-(q1+1)); if(L>64) L=64;
-            memcpy(J->merkle_hex[J->merkle_count], q1+1, L); J->merkle_hex[J->merkle_count][L]=0;
-            J->merkle_count++;
-            mp = q2+1;
+    // 1: job_id
+    if (!get_next_quoted(&p, rb, J->job_id, sizeof(J->job_id))) return 0;
+
+    // 2: prevhash (BE hex)
+    if (!get_next_quoted(&p, rb, J->prevhash_hex, sizeof(J->prevhash_hex))) return 0;
+
+    // 3: coinb1 (hex)
+    if (!get_next_quoted(&p, rb, J->coinb1_hex, sizeof(J->coinb1_hex))) return 0;
+
+    // 4: coinb2 (hex)
+    if (!get_next_quoted(&p, rb, J->coinb2_hex, sizeof(J->coinb2_hex))) return 0;
+
+    // 5: merkle[] (Array aus Strings)
+    // finde das nächste '[' und sein korrespondierendes ']'
+    const char *m_lb = NULL, *m_rb = NULL;
+    {
+        const char *scan = p;
+        for (; scan < rb; scan++) { if (*scan == '[') { m_lb = scan; break; } }
+        if (m_lb) {
+            for (scan = m_lb + 1; scan < rb; scan++) { if (*scan == ']') { m_rb = scan; break; } }
         }
-        p = me+1;
+    }
+    J->merkle_count = 0;
+    if (m_lb && m_rb && m_rb > m_lb) {
+        const char *mp = m_lb + 1;
+        while (J->merkle_count < 16) {
+            char tmp[65];
+            if (!get_next_quoted(&mp, m_rb, tmp, sizeof(tmp))) break;
+            snprintf(J->merkle_hex[J->merkle_count], sizeof(J->merkle_hex[0]), "%s", tmp);
+            J->merkle_count++;
+        }
+        p = m_rb + 1; // nach dem Merkle-Array weitermachen
     }
 
-    // version, nbits, ntime (quoted hex)
-    char vhex[16]={0}, nbhex[16]={0}, nth[16]={0};
-    if(!stratum_parse_notify){} // silence lambda capture warning
-    // 3 quoted strings following:
-    for(int i=0;i<3;i++){
-        char tmp[32]; if(!get_q(tmp,sizeof tmp)) break;
-        if(i==0) sscanf(tmp,"%x",&J->version);
-        if(i==1) sscanf(tmp,"%x",&J->nbits);
-        if(i==2) sscanf(tmp,"%x",&J->ntime);
+    // 6: version (quoted hex)
+    {
+        char vhex[16] = {0};
+        if (!get_next_quoted(&p, rb, vhex, sizeof(vhex))) return 0;
+        sscanf(vhex, "%x", &J->version);
     }
-    // clean flag:
-    J->clean = (strstr(line,"true") && !strstr(line,"\"result\"")) ? 1 : 0;
+
+    // 7: nbits (quoted hex)
+    {
+        char nbhex[16] = {0};
+        if (!get_next_quoted(&p, rb, nbhex, sizeof(nbhex))) return 0;
+        sscanf(nbhex, "%x", &J->nbits);
+    }
+
+    // 8: ntime (quoted hex)
+    {
+        char nth[16] = {0};
+        if (!get_next_quoted(&p, rb, nth, sizeof(nth))) return 0;
+        sscanf(nth, "%x", &J->ntime);
+    }
+
+    // 9: clean_jobs (bool) – grob erkennen
+    // wir schauen nur, ob irgendwo hinterher "true" / "false" steht
+    J->clean = 0;
+    {
+        const char *boolp = strstr(p, "true");
+        if (boolp && boolp < rb) J->clean = 1;
+    }
 
     return 1;
 }
+
 
 static int stratum_get_job(stratum_ctx_t *C, stratum_job_t *J){
     char line[16384];
