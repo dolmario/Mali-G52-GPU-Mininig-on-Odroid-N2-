@@ -29,36 +29,33 @@ __kernel void argon2d_core(__global const uchar *prehash32,
                            const uint t_cost,
                            const uint lanes,
                            __global uchar *out32,
-                           const uint start_idx,
-                           const uint end_idx)
+                           const uint start_block,
+                           const uint end_block)
 {
     (void)lanes; // single lane MVP
     __global ulong *memory = (__global ulong*)mem;
     const uint blocks = m_cost_kb; // 1KB per block
 
-    // Initialisierung nur einmal beim ersten Chunk
-    if (start_idx == 0) {
-        // Block 0: aus prehash initialisieren (sehr vereinfachtes H0)
-        for (int i = 0; i < 4; i++) {
-            ulong v = 0;
-            for (int j = 0; j < 8; j++)
-                v |= ((ulong)prehash32[i*8+j]) << (j*8);
-            memory[i] = v;
-        }
-        for (int i = 4; i < ARGON2_QWORDS_IN_BLOCK; i++) 
-            memory[i] = 0;
+    // Block 0: aus prehash initialisieren (immer bei jedem Kernel-Aufruf)
+    for (int i = 0; i < 4; i++) {
+        ulong v = 0;
+        for (int j = 0; j < 8; j++)
+            v |= ((ulong)prehash32[i*8+j]) << (j*8);
+        memory[i] = v;
     }
+    for (int i = 4; i < ARGON2_QWORDS_IN_BLOCK; i++) 
+        memory[i] = 0;
 
-    // Chunk-basierte Verarbeitung - nur den angegebenen Bereich verarbeiten
+    // Argon2d Passes - jetzt mit Block-Chunking für Mali-Watchdog-Schutz
     for (uint pass = 0; pass < t_cost; pass++) {
-        uint actual_start = (pass == 0) ? max(1U, start_idx) : start_idx;
-        uint actual_end = min(end_idx, blocks);
+        uint actual_start = max(1U, start_block);  // Block 0 ist schon initialisiert
+        uint actual_end = min(end_block, blocks);
         
         for (uint idx = actual_start; idx < actual_end; idx++) {
             __global ulong *prev = memory + (idx-1)*ARGON2_QWORDS_IN_BLOCK;
             __global ulong *curr = memory + idx*ARGON2_QWORDS_IN_BLOCK;
 
-            // in private kopieren + Salz
+            // State in private memory kopieren + Salting
             __private ulong state[ARGON2_QWORDS_IN_BLOCK];
             for (int i = 0; i < ARGON2_QWORDS_IN_BLOCK; i++)
                 state[i] = prev[i] ^ ((ulong)idx * 0x9e3779b97f4a7c15UL);
@@ -70,25 +67,21 @@ __kernel void argon2d_core(__global const uchar *prehash32,
                 }
             }
 
-            // zurückschreiben
+            // zurück in globalen Speicher schreiben
             for (int i = 0; i < ARGON2_QWORDS_IN_BLOCK; i++)
                 curr[i] = state[i];
         }
     }
 
-    // Final output nur wenn wir den letzten Block verarbeitet haben
-    if (end_idx >= blocks) {
-        // final: 32B aus letztem Block (reduziert) + XOR prehash
-        __global ulong *final_block = memory + (blocks-1)*ARGON2_QWORDS_IN_BLOCK;
-        for (int i = 0; i < 4; i++) {
-            ulong v = final_block[i];
-            for (int j = 0; j < 8; j++)
-                out32[i*8 + j] = (uchar)((v >> (j*8)) & 0xFF);
-        }
-        for (int i = 0; i < 32; i++) 
-            out32[i] ^= prehash32[i];
+    // Final output - vereinfacht: immer ausgeben (Host entscheidet was zu tun ist)
+    __global ulong *final_block = memory + (blocks-1)*ARGON2_QWORDS_IN_BLOCK;
+    for (int i = 0; i < 4; i++) {
+        ulong v = final_block[i];
+        for (int j = 0; j < 8; j++)
+            out32[i*8 + j] = (uchar)((v >> (j*8)) & 0xFF);
     }
+    for (int i = 0; i < 32; i++) 
+        out32[i] ^= prehash32[i];
 }
-
 
 
