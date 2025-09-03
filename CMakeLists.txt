@@ -62,6 +62,13 @@ target_link_libraries(rin_ocl PRIVATE
   pthread
 )
 
-# Kernel ins Build-Verzeichnis kopieren
-configure_file(${CMAKE_SOURCE_DIR}/src/rinhash_argon2d.cl
-               ${CMAKE_BINARY_DIR}/rinhash_argon2d.cl COPYONLY)
+# Kernel ins Build-Verzeichnis kopieren (auto: kernels/ ODER src/)
+if (EXISTS "${CMAKE_SOURCE_DIR}/kernels/rinhash_argon2d.cl")
+  set(KERNEL_SRC "${CMAKE_SOURCE_DIR}/kernels/rinhash_argon2d.cl")
+elseif (EXISTS "${CMAKE_SOURCE_DIR}/src/rinhash_argon2d.cl")
+  set(KERNEL_SRC "${CMAKE_SOURCE_DIR}/src/rinhash_argon2d.cl")
+else ()
+  message(FATAL_ERROR "rinhash_argon2d.cl not found in kernels/ or src/")
+endif()
+
+configure_file("${KERNEL_SRC}" "${CMAKE_BINARY_DIR}/rinhash_argon2d.cl" COPYONLY)
