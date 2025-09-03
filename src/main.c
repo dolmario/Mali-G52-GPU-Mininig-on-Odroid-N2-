@@ -22,7 +22,7 @@
 #include <time.h>
 
 #include "blake3.h"
-#include "argon2.h"   // PHC reference (du hast core.c/… eingebunden)
+#include "argon2.h"
 
 // ============================ Konfig =============================
 static const char *POOL_CANDIDATES[] = {
@@ -43,6 +43,10 @@ static const cl_uint M_COST_KB = 64;  // 64 KiB
 
 // Debug toggles (per Env)
 static int g_debug = 0;
+static uint32_t g_cpu_t_cost = 2;
+static uint32_t g_cpu_m_kib = 64;
+static uint32_t g_cpu_lanes = 1;
+static int g_salt_mode = 2; // 0=zero16, 1=prehash(default), 2="RinCoinSalt", 3=no-salt
 
 // ============================ Utils ==============================
 static void blake3_hash32(const uint8_t *in, size_t len, uint8_t out[32]) {
@@ -425,7 +429,7 @@ static void stratum_wait_submit_ack(int sock) {
                     fflush(stdout);
                     return;
                 } else if (strstr(line, "\"error\"")) {
-                    printf(" -> REJECTED: %s\n", line);
+                    printf(" -> REJECTED: %s", line);
                     fflush(stdout);
                     return;
                 }
@@ -519,303 +523,312 @@ static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int sig){ (void)sig; g_stop = 1; }
 
 // ======================= CPU Argon2d Oracle ======================
-static int argon2d_cpu_raw(const uint8_t* pwd, uint32_t pwdlen,
-                           const uint8_t* salt, uint32_t saltlen,
-                           uint8_t out[32], uint32_t version) {
-    // nutzt PHC argon2d_hash_raw
-    int rc = argon2d_hash_raw(
-        T_COST,            // t_cost
-        M_COST_KB,         // m_cost in KiB
-        1,                 // parallelism/lanes
-        pwd,  pwdlen,
-        salt, saltlen,
-        out,  32,
-        version);
-    return rc == ARGON2_OK;
+static int argon2d_cpu_check(const uint8_t* pwd, uint32_t pwdlen,
+                              const uint8_t* salt, uint32_t saltlen,
+                              uint8_t out[32]) {
+    argon2_context context = {
+        .out = out,
+        .outlen = 32,
+        .pwd = (uint8_t*)pwd,
+        .pwdlen = pwdlen,
+        .salt = (uint8_t*)salt,
+        .saltlen = saltlen,
+        .secret = NULL,
+        .secretlen = 0,
+        .ad = NULL,
+        .adlen = 0,
+        .t_cost = g_cpu_t_cost,
+       .m_cost = g_cpu_m_kib,
+       .lanes = g_cpu_lanes,
+       .threads = 1,
+       .version = ARGON2_VERSION_13,
+       .allocate_cbk = NULL,
+       .free_cbk = NULL,
+       .flags = ARGON2_DEFAULT_FLAGS
+   };
+   
+   int result = argon2_ctx(&context, Argon2_d);
+   return result == ARGON2_OK;
 }
 
-static int cpu_try_modes(const uint8_t prehash[32],
-                         const uint8_t prevhash_le[32],
-                         const uint8_t merkleroot_le[32],
-                         const uint8_t coinbase_hash_be[32],
-                         const uint8_t *ex1, size_t ex1b,
-                         const uint8_t *ex2, size_t ex2b,
-                         uint8_t out32[32], int *matched_mode) {
-    // Wir probieren mehrere Salt-Varianten (bis Spec bestätigt ist)
+static int cpu_argon2d_reference(const uint8_t prehash[32], uint8_t cpu_out[32]) {
     uint8_t salt[64];
-    int modes[] = {0,1,2,3,4,5}; // 0..5
-    const char* names[] = {
-        "salt=all-zero(16)",
-        "salt=prevhash(LE32)",
-        "salt=merkleroot(LE32)",
-        "salt=coinbase_hash(BE32)",
-        "salt=ex1||ex2",
-        "salt=header-prehash-again(32)"
-    };
-    for (size_t i=0;i<sizeof(modes)/sizeof(modes[0]);i++) {
-        int m = modes[i];
-        uint32_t ver = ARGON2_VERSION_13; // v1.3; wir testen ggf. 1.0 zusätzlich
-        int ok = 0;
-        switch (m) {
-            case 0: memset(salt,0,16); ok = argon2d_cpu_raw(prehash,32,salt,16,out32,ver); break;
-            case 1: memcpy(salt,prevhash_le,32); ok = argon2d_cpu_raw(prehash,32,salt,32,out32,ver); break;
-            case 2: memcpy(salt,merkleroot_le,32); ok = argon2d_cpu_raw(prehash,32,salt,32,out32,ver); break;
-            case 3: memcpy(salt,coinbase_hash_be,32); ok = argon2d_cpu_raw(prehash,32,salt,32,out32,ver); break;
-            case 4: {
-                size_t L = 0;
-                if (ex1 && ex1b) { memcpy(salt+L, ex1, ex1b); L += ex1b; }
-                if (ex2 && ex2b) { memcpy(salt+L, ex2, ex2b); L += ex2b; }
-                if (L < 8) { memset(salt,0,8); L = 8; }
-                ok = argon2d_cpu_raw(prehash,32,salt,(uint32_t)L,out32,ver);
-                break;
-            }
-            case 5: {
-                // „prehash“ nochmal als Salt (nur zum Ausschluss)
-                memcpy(salt,prehash,32);
-                ok = argon2d_cpu_raw(prehash,32,salt,32,out32,ver);
-                break;
-            }
-        }
-        if (!ok) continue;
-
-        // auch v1.0 testen, falls v1.3 nicht matcht
-        *matched_mode = m;
-        return 1;
+    uint32_t saltlen = 0;
+    
+    switch (g_salt_mode) {
+        case 0: // zero16
+            memset(salt, 0, 16);
+            saltlen = 16;
+            break;
+        case 1: // prehash (default)
+            memcpy(salt, prehash, 32);
+            saltlen = 32;
+            break;
+        case 2: // "RinCoinSalt"
+            strcpy((char*)salt, "RinCoinSalt");
+            saltlen = strlen("RinCoinSalt");
+            break;
+        case 3: // no salt
+            saltlen = 0;
+            break;
+        default:
+            memcpy(salt, prehash, 32);
+            saltlen = 32;
+            break;
     }
-    *matched_mode = -1;
-    return 0;
+    
+    return argon2d_cpu_check(prehash, 32, salt, saltlen, cpu_out);
 }
-
 // ============================== MAIN ============================
 int main(int argc, char **argv) {
-    signal(SIGINT, on_sigint);
-    if (getenv("RIN_DEBUG")) g_debug = atoi(getenv("RIN_DEBUG"));
+   signal(SIGINT, on_sigint);
+   
+   // ENV Variablen lesen
+   if (getenv("RIN_DEBUG")) g_debug = atoi(getenv("RIN_DEBUG"));
+   if (getenv("RIN_T_COST")) g_cpu_t_cost = (uint32_t)atoi(getenv("RIN_T_COST"));
+   if (getenv("RIN_M_KiB")) g_cpu_m_kib = (uint32_t)atoi(getenv("RIN_M_KiB"));
+   if (getenv("RIN_LANES")) g_cpu_lanes = (uint32_t)atoi(getenv("RIN_LANES"));
+   if (getenv("RIN_SALT_MODE")) g_salt_mode = atoi(getenv("RIN_SALT_MODE"));
 
-    cl_uint m_cost_kb = M_COST_KB;
-    if (argc > 1) printf("WARNING: Memory arg ignored. Using spec-compliant 64 KiB\n");
-    printf("Using %u KiB memory (RinHash spec)\n", (unsigned)m_cost_kb);
+   cl_uint m_cost_kb = M_COST_KB;
+   if (argc > 1) printf("WARNING: Memory arg ignored. Using spec-compliant 64 KiB\n");
+   printf("Using %u KiB memory (RinHash spec)\n", (unsigned)m_cost_kb);
+   
+   if (g_debug) {
+       printf("CPU Argon2d params: t_cost=%u, m_cost=%u KiB, lanes=%u, salt_mode=%d\n",
+              g_cpu_t_cost, g_cpu_m_kib, g_cpu_lanes, g_salt_mode);
+   }
 
-    // OpenCL Setup
-    cl_int err; cl_platform_id plat; cl_device_id dev;
-    clGetPlatformIDs(1,&plat,NULL);
-    err = clGetDeviceIDs(plat,CL_DEVICE_TYPE_GPU,1,&dev,NULL);
-    if (err!=CL_SUCCESS){ fprintf(stderr,"No GPU device found\n"); return 1; }
+   // OpenCL Setup
+   cl_int err; cl_platform_id plat; cl_device_id dev;
+   clGetPlatformIDs(1,&plat,NULL);
+   err = clGetDeviceIDs(plat,CL_DEVICE_TYPE_GPU,1,&dev,NULL);
+   if (err!=CL_SUCCESS){ fprintf(stderr,"No GPU device found\n"); return 1; }
 
-    char devname[256]; clGetDeviceInfo(dev,CL_DEVICE_NAME,sizeof devname,devname,NULL);
-    printf("Device: %s\n", devname);
+   char devname[256]; clGetDeviceInfo(dev,CL_DEVICE_NAME,sizeof devname,devname,NULL);
+   printf("Device: %s\n", devname);
 
-    cl_context ctx = clCreateContext(NULL,1,&dev,NULL,NULL,&err);
-    cl_command_queue q = clCreateCommandQueue(ctx,dev,0,&err);
-    if (err!=CL_SUCCESS){ fprintf(stderr,"clCreateCommandQueue: %d\n",err); return 1; }
+   cl_context ctx = clCreateContext(NULL,1,&dev,NULL,NULL,&err);
+   cl_command_queue q = clCreateCommandQueue(ctx,dev,0,&err);
+   if (err!=CL_SUCCESS){ fprintf(stderr,"clCreateCommandQueue: %d\n",err); return 1; }
 
-    char *ksrc = load_kernel_source("rinhash_argon2d.cl");
-    cl_program prog = clCreateProgramWithSource(ctx,1,(const char**)&ksrc,NULL,&err);
-    err = clBuildProgram(prog,1,&dev,"-cl-std=CL1.2",NULL,NULL);
-    if (err!=CL_SUCCESS){
-        size_t L; clGetProgramBuildInfo(prog,dev,CL_PROGRAM_BUILD_LOG,0,NULL,&L);
-        char *log=(char*)malloc(L+1); clGetProgramBuildInfo(prog,dev,CL_PROGRAM_BUILD_LOG,L,log,NULL);
-        log[L]=0; fprintf(stderr,"Build failed:\n%s\n",log); free(log); return 1;
-    }
-    cl_kernel krn = clCreateKernel(prog,"argon2d_core",&err);
-    if (err!=CL_SUCCESS){ fprintf(stderr,"clCreateKernel failed: %d\n", err); return 1; }
+   char *ksrc = load_kernel_source("rinhash_argon2d.cl");
+   cl_program prog = clCreateProgramWithSource(ctx,1,(const char**)&ksrc,NULL,&err);
+   err = clBuildProgram(prog,1,&dev,"-cl-std=CL1.2",NULL,NULL);
+   if (err!=CL_SUCCESS){
+       size_t L; clGetProgramBuildInfo(prog,dev,CL_PROGRAM_BUILD_LOG,0,NULL,&L);
+       char *log=(char*)malloc(L+1); clGetProgramBuildInfo(prog,dev,CL_PROGRAM_BUILD_LOG,L,log,NULL);
+       log[L]=0; fprintf(stderr,"Build failed:\n%s\n",log); free(log); return 1;
+   }
+   cl_kernel krn = clCreateKernel(prog,"argon2d_core",&err);
+   if (err!=CL_SUCCESS){ fprintf(stderr,"clCreateKernel failed: %d\n", err); return 1; }
 
-    // Speicher: 64 KiB
-    size_t m_bytes = (size_t)m_cost_kb * 1024;
-    cl_mem d_mem   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,m_bytes,NULL,&err);
-    cl_mem d_phash = clCreateBuffer(ctx,CL_MEM_READ_ONLY, 32,NULL,&err);
-    cl_mem d_out   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,32,NULL,&err);
+   // Speicher: 64 KiB
+   size_t m_bytes = (size_t)m_cost_kb * 1024;
+   cl_mem d_mem   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,m_bytes,NULL,&err);
+   cl_mem d_phash = clCreateBuffer(ctx,CL_MEM_READ_ONLY, 32,NULL,&err);
+   cl_mem d_out   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,32,NULL,&err);
 
-    // ===== Stratum =====
-    int         PORT = getenv("POOL_PORT") ? atoi(getenv("POOL_PORT")) : PORT_DEFAULT;
-    stratum_ctx_t S;
-    if(!stratum_connect_any(&S, POOL_CANDIDATES, PORT, WAL, PASS)){
-        fprintf(stderr,"Stratum connect failed (all hosts)\n");
-        return 1;
-    }
+   // ===== Stratum =====
+   int         PORT = getenv("POOL_PORT") ? atoi(getenv("POOL_PORT")) : PORT_DEFAULT;
+   stratum_ctx_t S;
+   if(!stratum_connect_any(&S, POOL_CANDIDATES, PORT, WAL, PASS)){
+       fprintf(stderr,"Stratum connect failed (all hosts)\n");
+       return 1;
+   }
 
-    uint8_t prevhash_le[32], merkleroot_le[32], target_be[32];
-    stratum_job_t J={0}, Jnew={0}; int have_job=0;
+   uint8_t prevhash_le[32], merkleroot_le[32], target_be[32];
+   stratum_job_t J={0}, Jnew={0}; int have_job=0;
 
-    uint64_t hashes_window = 0;
-    uint64_t t_print = mono_ms();
-    uint64_t t_poll  = mono_ms();
+   uint64_t hashes_window = 0;
+   uint64_t t_print = mono_ms();
+   uint64_t t_poll  = mono_ms();
 
-    while (!g_stop) {
-        // Polling
-        if (mono_ms() - t_poll >= 100) {
-            while (stratum_get_job(&S, &Jnew)) {
-                if (!have_job || strcmp(Jnew.job_id, J.job_id) != 0 || Jnew.clean) {
-                    J = Jnew; have_job = 1;
-                    uint8_t prev_be[32]; hex2bin(J.prevhash_hex, prev_be, 32);
-                    for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be[31 - i];
-                    target_from_nbits(J.nbits, target_be);
-                    printf("Job %s ready. nbits=%08x ntime=%08x\n", J.job_id, J.nbits, J.ntime);
-                    fflush(stdout);
-                }
-            }
-            t_poll = mono_ms();
-        }
-        if (!have_job) { usleep(10000); continue; }
+   while (!g_stop) {
+       // Polling
+       if (mono_ms() - t_poll >= 100) {
+           while (stratum_get_job(&S, &Jnew)) {
+               if (!have_job || strcmp(Jnew.job_id, J.job_id) != 0 || Jnew.clean) {
+                   J = Jnew; have_job = 1;
+                   uint8_t prev_be[32]; hex2bin(J.prevhash_hex, prev_be, 32);
+                   for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be[31 - i];
+                   target_from_nbits(J.nbits, target_be);
+                   printf("Job %s ready. nbits=%08x ntime=%08x\n", J.job_id, J.nbits, J.ntime);
+                   fflush(stdout);
+               }
+           }
+           t_poll = mono_ms();
+       }
+       if (!have_job) { usleep(10000); continue; }
 
-        // Coinbase, Merkle
-        uint8_t coinb1[4096], coinb2[4096];
-        size_t cb1 = strlen(J.coinb1_hex) / 2, cb2 = strlen(J.coinb2_hex) / 2;
-        hex2bin(J.coinb1_hex, coinb1, cb1);
-        hex2bin(J.coinb2_hex, coinb2, cb2);
+       // Coinbase, Merkle
+       uint8_t coinb1[4096], coinb2[4096];
+       size_t cb1 = strlen(J.coinb1_hex) / 2, cb2 = strlen(J.coinb2_hex) / 2;
+       hex2bin(J.coinb1_hex, coinb1, cb1);
+       hex2bin(J.coinb2_hex, coinb2, cb2);
 
-        uint8_t en1[64]; size_t en1b = strlen(S.extranonce1) / 2; if (en1b > 64) en1b = 64;
-        hex2bin(S.extranonce1, en1, en1b);
-        static cl_uint en2_counter = 1;
-        char en2_hex[64];
-        snprintf(en2_hex, sizeof en2_hex, "%0*x", S.extranonce2_size * 2, en2_counter++);
-        uint8_t en2[64]; hex2bin(en2_hex, en2, S.extranonce2_size);
+       uint8_t en1[64]; size_t en1b = strlen(S.extranonce1) / 2; if (en1b > 64) en1b = 64;
+       hex2bin(S.extranonce1, en1, en1b);
+       static cl_uint en2_counter = 1;
+       char en2_hex[64];
+       snprintf(en2_hex, sizeof en2_hex, "%0*x", S.extranonce2_size * 2, en2_counter++);
+       uint8_t en2[64]; hex2bin(en2_hex, en2, S.extranonce2_size);
 
-        uint8_t coinbase[8192]; size_t off = 0;
-        memcpy(coinbase + off, coinb1, cb1); off += cb1;
-        memcpy(coinbase + off, en1, en1b); off += en1b;
-        memcpy(coinbase + off, en2, S.extranonce2_size); off += S.extranonce2_size;
-        memcpy(coinbase + off, coinb2, cb2); off += cb2;
+       uint8_t coinbase[8192]; size_t off = 0;
+       memcpy(coinbase + off, coinb1, cb1); off += cb1;
+       memcpy(coinbase + off, en1, en1b); off += en1b;
+       memcpy(coinbase + off, en2, S.extranonce2_size); off += S.extranonce2_size;
+       memcpy(coinbase + off, coinb2, cb2); off += cb2;
 
-        uint8_t cbh_be[32]; double_sha256(coinbase, off, cbh_be);
-        build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
+       uint8_t cbh_be[32]; double_sha256(coinbase, off, cbh_be);
+       build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
 
-        // === Nonce-Schleife ===
-        const cl_uint NONCES_PER_ITER = 20000;
-        int did_debug_for_job = 0;
+       // === Nonce-Schleife ===
+       const cl_uint NONCES_PER_ITER = 20000;
+       static int did_debug_for_job = 0;
 
-        for (cl_uint nonce = 0; nonce < NONCES_PER_ITER && !g_stop; nonce++) {
-            // Header (LE)
-            uint8_t header[80];
-            build_header_le(&J, prevhash_le, merkleroot_le, J.ntime, J.nbits, nonce, header);
+       for (cl_uint nonce = 0; nonce < NONCES_PER_ITER && !g_stop; nonce++) {
+           // Header (LE)
+           uint8_t header[80];
+           build_header_le(&J, prevhash_le, merkleroot_le, J.ntime, J.nbits, nonce, header);
 
-            // BLAKE3 (pwd)
-            uint8_t prehash[32]; blake3_hash32(header, 80, prehash);
+           // BLAKE3 (pwd)
+           uint8_t prehash[32]; blake3_hash32(header, 80, prehash);
 
-            // d_out nullen
-            static const uint8_t zero32[32] = {0};
-            clEnqueueWriteBuffer(q, d_out, CL_FALSE, 0, 32, zero32, 0, NULL, NULL);
+           // d_out nullen
+           static const uint8_t zero32[32] = {0};
+           clEnqueueWriteBuffer(q, d_out, CL_FALSE, 0, 32, zero32, 0, NULL, NULL);
 
-            // Prehash schreiben (Warte nur auf diesen Transfer)
-            cl_event write_ev;
-            clEnqueueWriteBuffer(q, d_phash, CL_FALSE, 0, 32, prehash, 0, NULL, &write_ev);
-            clWaitForEvents(1, &write_ev);
-            clReleaseEvent(write_ev);
+           // Prehash schreiben (Warte nur auf diesen Transfer)
+           cl_event write_ev;
+           clEnqueueWriteBuffer(q, d_phash, CL_FALSE, 0, 32, prehash, 0, NULL, &write_ev);
+           clWaitForEvents(1, &write_ev);
+           clReleaseEvent(write_ev);
 
-            // ===== Kernel-Args korrekt & jedes Mal setzen =====
-            err = clSetKernelArg(krn, 0, sizeof(cl_mem), &d_phash);         check_arg("prehash32", err, 0);
-            err = clSetKernelArg(krn, 1, sizeof(cl_mem), &d_mem);           check_arg("mem", err, 1);
-            err = clSetKernelArg(krn, 2, sizeof(cl_uint), &m_cost_kb);      check_arg("blocks_per_lane", err, 2);
-            err = clSetKernelArg(krn, 7, sizeof(cl_mem), &d_out);           check_arg("out32", err, 7);
+           // ===== Kernel-Args korrekt & jedes Mal setzen =====
+           err = clSetKernelArg(krn, 0, sizeof(cl_mem), &d_phash);         check_arg("prehash32", err, 0);
+           err = clSetKernelArg(krn, 1, sizeof(cl_mem), &d_mem);           check_arg("mem", err, 1);
+           err = clSetKernelArg(krn, 2, sizeof(cl_uint), &m_cost_kb);      check_arg("blocks_per_lane", err, 2);
+           err = clSetKernelArg(krn, 7, sizeof(cl_mem), &d_out);           check_arg("out32", err, 7);
 
-            // t=2, 4 Slices, CHUNK_BLOCKS
-            for (cl_uint pass = 0; pass < T_COST; pass++) {
-                for (cl_uint slice = 0; slice < 4; slice++) {
-                    const cl_uint slice_begin = slice * (m_cost_kb / 4);
-                    const cl_uint slice_end   = (slice + 1) * (m_cost_kb / 4);
-                    for (cl_uint start = slice_begin; start < slice_end; start += CHUNK_BLOCKS) {
-                        cl_uint end = start + CHUNK_BLOCKS; if (end > slice_end) end = slice_end;
-                        const cl_uint do_init = (pass == 0 && slice == 0 && start == 0) ? 1U : 0U;
+           // t=2, 4 Slices, CHUNK_BLOCKS
+           for (cl_uint pass = 0; pass < T_COST; pass++) {
+               for (cl_uint slice = 0; slice < 4; slice++) {
+                   const cl_uint slice_begin = slice * (m_cost_kb / 4);
+                   const cl_uint slice_end   = (slice + 1) * (m_cost_kb / 4);
+                   for (cl_uint start = slice_begin; start < slice_end; start += CHUNK_BLOCKS) {
+                       cl_uint end = start + CHUNK_BLOCKS; if (end > slice_end) end = slice_end;
+                       const cl_uint do_init = (pass == 0 && slice == 0 && start == 0) ? 1U : 0U;
 
-                        err = clSetKernelArg(krn, 3, sizeof(cl_uint), &pass);   check_arg("pass_index", err, 3);
-                        err = clSetKernelArg(krn, 4, sizeof(cl_uint), &slice);  check_arg("slice_index", err, 4);
-                        err = clSetKernelArg(krn, 5, sizeof(cl_uint), &start);  check_arg("start_block", err, 5);
-                        err = clSetKernelArg(krn, 6, sizeof(cl_uint), &end);    check_arg("end_block", err, 6);
-                        err = clSetKernelArg(krn, 8, sizeof(cl_uint), &do_init);check_arg("do_init", err, 8);
+                       err = clSetKernelArg(krn, 3, sizeof(cl_uint), &pass);   check_arg("pass_index", err, 3);
+                       err = clSetKernelArg(krn, 4, sizeof(cl_uint), &slice);  check_arg("slice_index", err, 4);
+                       err = clSetKernelArg(krn, 5, sizeof(cl_uint), &start);  check_arg("start_block", err, 5);
+                       err = clSetKernelArg(krn, 6, sizeof(cl_uint), &end);    check_arg("end_block", err, 6);
+                       err = clSetKernelArg(krn, 8, sizeof(cl_uint), &do_init);check_arg("do_init", err, 8);
 
-                        size_t G = 1;
-                        err = clEnqueueNDRangeKernel(q, krn, 1, NULL, &G, NULL, 0, NULL, NULL);
-                        if (err != CL_SUCCESS) {
-                            fprintf(stderr, "clEnqueueNDRangeKernel failed: %d\n", err);
-                            exit(1);
-                        }
-                        clFlush(q);
-                    }
-                }
-            }
-            clFinish(q);
+                       size_t G = 1;
+                       err = clEnqueueNDRangeKernel(q, krn, 1, NULL, &G, NULL, 0, NULL, NULL);
+                       if (err != CL_SUCCESS) {
+                           fprintf(stderr, "clEnqueueNDRangeKernel failed: %d\n", err);
+                           exit(1);
+                       }
+                       clFlush(q);
+                   }
+               }
+           }
+           clFinish(q);
 
-            // GPU-Argon2d-Output (roh, 32B)
-            uint8_t argon_gpu[32]; clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32, argon_gpu, 0, NULL, NULL);
+           // GPU-Argon2d-Output (roh, 32B)
+           uint8_t argon_gpu[32]; clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32, argon_gpu, 0, NULL, NULL);
 
-            // === Debug: CPU-Referenz vergleichen (nur 1x pro Job, wenn aktiviert)
-            if (g_debug && !did_debug_for_job) {
-                uint8_t cpu_out[32];
-                int mode=-1;
-                int ok = cpu_try_modes(prehash, prevhash_le, merkleroot_le, cbh_be,
-                                       en1, en1b, en2, S.extranonce2_size, cpu_out, &mode);
-                printf("\n[DEBUG] Comparing GPU vs CPU Argon2d (t=2, m=64KiB, lanes=1)\n");
-                hexdump("prehash", prehash, 32);
-                hexdump("gpu_argon2", argon_gpu, 32);
-                if (ok) {
-                    hexdump("cpu_argon2", cpu_out, 32);
-                    printf("[DEBUG] salt-mode=%d (%s)\n", mode,
-                           (mode==0)?"zero16":(mode==1)?"prevhashLE":
-                           (mode==2)?"merklerootLE":(mode==3)?"coinbaseHashBE":
-                           (mode==4)?"ex1||ex2":"prehash-as-salt");
-                    if (memcmp(cpu_out, argon_gpu, 32)==0) {
-                        printf("[DEBUG] CPU == GPU ✅\n");
-                    } else {
-                        printf("[DEBUG] CPU != GPU ❌  (Kernel-Indexing/Spec abweichend)\n");
-                    }
-                } else {
-                    printf("[DEBUG] CPU Argon2 run failed (lib not linked?)\n");
-                }
-                did_debug_for_job = 1;
-            }
+           // === Debug: CPU-Referenz vergleichen (nur 1x pro Job bei erstem Nonce)
+           if (g_debug && !did_debug_for_job && nonce == 0) {
+               uint8_t cpu_out[32];
+               printf("\n[DEBUG] GPU vs CPU Argon2d check (Job: %s, nonce: %u)\n", J.job_id, nonce);
+               hexdump("prehash", prehash, 32);
+               hexdump("gpu_argon2", argon_gpu, 32);
+               
+               if (cpu_argon2d_reference(prehash, cpu_out)) {
+                   hexdump("cpu_argon2", cpu_out, 32);
+                   const char* salt_names[] = {"zero16", "prehash", "RinCoinSalt", "no-salt"};
+                   printf("[DEBUG] CPU params: t=%u, m=%u KiB, lanes=%u, salt=%s\n",
+                          g_cpu_t_cost, g_cpu_m_kib, g_cpu_lanes, 
+                          (g_salt_mode >= 0 && g_salt_mode <= 3) ? salt_names[g_salt_mode] : "unknown");
+                   
+                   if (memcmp(cpu_out, argon_gpu, 32) == 0) {
+                       printf("[DEBUG] CPU == GPU ✅\n");
+                   } else {
+                       printf("[DEBUG] CPU != GPU ❌\n");
+                   }
+               } else {
+                   printf("[DEBUG] CPU Argon2d failed\n");
+               }
+               printf("\n");
+               did_debug_for_job = 1;
+           }
 
-            // Final SHA3-256 über Argon-Output
-            uint8_t final_hash[32]; sha3_256(argon_gpu, 32, final_hash);
+           // Final SHA3-256 über Argon-Output
+           uint8_t final_hash[32]; sha3_256(argon_gpu, 32, final_hash);
 
-            // Target (BE) Vergleich
-            int ok = 1;
-            for (int i = 0; i < 32; i++) {
-                if (final_hash[i] < target_be[i]) { ok = 1; break; }
-                if (final_hash[i] > target_be[i]) { ok = 0; break; }
-            }
-            if (ok) {
-                if (stratum_submit(&S, &J, en2_hex, J.ntime, nonce)) {
-                    printf("FOUND share  ntime=%08x nonce=%08x", J.ntime, nonce);
-                    // ACK-Ausgabe passiert im Submit
-                } else {
-                    fprintf(stderr, "\nSubmit failed\n");
-                }
-            }
+           // Target (BE) Vergleich
+           int ok = 1;
+           for (int i = 0; i < 32; i++) {
+               if (final_hash[i] < target_be[i]) { ok = 1; break; }
+               if (final_hash[i] > target_be[i]) { ok = 0; break; }
+           }
+           if (ok) {
+               printf("FOUND share  ntime=%08x nonce=%08x", J.ntime, nonce);
+               if (stratum_submit(&S, &J, en2_hex, J.ntime, nonce)) {
+                   // ACK-Ausgabe passiert im Submit
+               } else {
+                   printf(" -> Submit failed\n");
+               }
+           }
 
-            // Stats
-            hashes_window++;
-            uint64_t now = mono_ms();
-            static uint64_t t_print_local = 0;
-            if (!t_print_local) t_print_local = now;
-            if (now - t_print_local >= 5000) {
-                double secs = (now - t_print_local) / 1000.0;
-                double rate = hashes_window / secs;
-                printf("Hashrate: %.1f H/s | Job: %s\r", rate, J.job_id[0]?J.job_id:"-");
-                fflush(stdout);
-                t_print_local = now;
-                hashes_window = 0;
-            }
+           // Stats
+           hashes_window++;
+           uint64_t now = mono_ms();
+           static uint64_t t_print_local = 0;
+           if (!t_print_local) t_print_local = now;
+           if (now - t_print_local >= 5000) {
+               double secs = (now - t_print_local) / 1000.0;
+               double rate = hashes_window / secs;
+               printf("Hashrate: %.1f H/s | Job: %s\r", rate, J.job_id[0]?J.job_id:"-");
+               fflush(stdout);
+               t_print_local = now;
+               hashes_window = 0;
+           }
 
-            // sanftes Stratum-Polling
-            if ((nonce % 1000) == 0 && mono_ms() - t_poll >= 100) {
-                stratum_job_t Jtmp;
-                while (stratum_get_job(&S, &Jtmp)) {
-                    if (strcmp(Jtmp.job_id, J.job_id) != 0 || Jtmp.clean) {
-                        J = Jtmp;
-                        uint8_t prev_be2[32]; hex2bin(J.prevhash_hex, prev_be2, 32);
-                        for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be2[31 - i];
-                        target_from_nbits(J.nbits, target_be);
-                        printf("\nSwitch to job %s\n", J.job_id);
-                        fflush(stdout);
-                        did_debug_for_job = 0; // bei neuem Job wieder 1x debuggen
-                        break;
-                    }
-                }
-                t_poll = mono_ms();
-            }
-        } // nonces
-        usleep(5000);
-    }
+           // sanftes Stratum-Polling
+           if ((nonce % 1000) == 0 && mono_ms() - t_poll >= 100) {
+               stratum_job_t Jtmp;
+               while (stratum_get_job(&S, &Jtmp)) {
+                   if (strcmp(Jtmp.job_id, J.job_id) != 0 || Jtmp.clean) {
+                       J = Jtmp;
+                       uint8_t prev_be2[32]; hex2bin(J.prevhash_hex, prev_be2, 32);
+                       for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be2[31 - i];
+                       target_from_nbits(J.nbits, target_be);
+                       printf("\nSwitch to job %s\n", J.job_id);
+                       fflush(stdout);
+                       did_debug_for_job = 0; // bei neuem Job wieder debuggen erlauben
+                       break;
+                   }
+               }
+               t_poll = mono_ms();
+           }
+       } // nonces
+       usleep(5000);
+   }
 
-    return 0;
+   clReleaseKernel(krn);
+   clReleaseProgram(prog);
+   clReleaseMemObject(d_mem);
+   clReleaseMemObject(d_phash);
+   clReleaseMemObject(d_out);
+   clReleaseCommandQueue(q);
+   clReleaseContext(ctx);
+   close(S.sock);
+   free(ksrc);
+
+   return 0;
 }
-
