@@ -24,9 +24,8 @@ static const char *WAL  = "DTXoRQ7Zpw3FVRW2DWkLrM9Skj4Gp9SeSj";
 static const char *PASS = "c=DOGE,ID=n2plus";
 
 // Chunk-Größe in Blöcken (1 Block = 1 KB)
-// 512 ist konservativ für Mali, später 1024/2048 probieren wenn stabil.
-#define CHUNK_BLOCKS 512   // kleiner für Mali-Timeout/Watchdog
-static const uint32_t T_COST = 2;    // Argon2d-Pässe (RinHash nutzt i.d.R. 2)
+#define CHUNK_BLOCKS 512   // konservativ für Mali-Timeout/Watchdog
+static const uint32_t T_COST = 2;    // Argon2d-Pässe
 
 // ============================ Utils ==============================
 static void blake3_hash32(const uint8_t *in, size_t len, uint8_t out[32]) {
@@ -136,7 +135,7 @@ static int send_line(int s, const char *line) {
 }
 
 // -------- robuster Zeilenpuffer --------
-static char inbuf[32768];
+static char inbuf[65536];
 static size_t inlen = 0;
 
 static int recv_into_buffer(int s, int timeout_ms) {
@@ -145,7 +144,7 @@ static int recv_into_buffer(int s, int timeout_ms) {
     tv.tv_sec = timeout_ms/1000; tv.tv_usec = (timeout_ms%1000)*1000;
     int sel = select(s+1,&rfds,NULL,NULL,&tv);
     if (sel <= 0) return 0;
-    char tmp[4096];
+    char tmp[8192];
     ssize_t n = recv(s,tmp,sizeof tmp,MSG_DONTWAIT);
     if (n <= 0) return 0;
     if (inlen + (size_t)n >= sizeof inbuf) inlen = 0; // Reset bei Überlauf
@@ -163,6 +162,81 @@ static int next_line(char *out, size_t cap) {
     return 0;
 }
 
+// --- Subscribe-Parsing (extranonce sauber) ---
+static const char* find_after_result_array_first(const char *s) {
+    const char *p = strstr(s, "\"result\""); if (!p) return NULL;
+    p = strchr(p, '['); if (!p) return NULL; // auf '[' der result-Array
+    // erstes Element ist Sub-Details (Array) – dessen schließendes ']' finden:
+    int depth = 0;
+    for (; *p; p++){
+        if (*p == '[') depth++;
+        else if (*p == ']') {
+            depth--;
+            if (depth == 1) { // Ende des ersten Elements (wir sind noch in result)
+                return p+1;   // nach dem ersten Element
+            }
+        }
+    }
+    return NULL;
+}
+
+static int parse_subscribe_result(const char *line, char *ex1, size_t ex1cap, uint32_t *ex2sz){
+    const char *after_first = find_after_result_array_first(line);
+    if (!after_first) return 0;
+    const char *q1 = strchr(after_first, '"'); if(!q1) return 0;
+    const char *q2 = strchr(q1+1, '"');       if(!q2) return 0;
+    size_t L = (size_t)(q2 - (q1+1)); if (L >= ex1cap) L = ex1cap-1;
+    memcpy(ex1, q1+1, L); ex1[L] = 0;
+
+    const char *p = q2+1;
+    while (*p && (*p==' ' || *p==',' || *p==']')) p++;
+    unsigned long v = strtoul(p, NULL, 10);
+    if (v == 0 || v > 32) v = 4;
+    *ex2sz = (uint32_t)v;
+    return 1;
+}
+
+static int stratum_connect(stratum_ctx_t *C,const char *host,int port,const char *user,const char *pass){
+    memset(C,0,sizeof *C);
+    snprintf(C->host,sizeof C->host,"%s",host); C->port=port;
+    snprintf(C->wallet,sizeof C->wallet,"%s",user);
+    snprintf(C->pass,sizeof C->pass,"%s",pass);
+    C->sock = sock_connect(host,port); if (C->sock<0) return 0;
+
+    char sub[256];
+    snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/0.5\"]}\n");
+    if(!send_line(C->sock,sub)) return 0;
+
+    // Warte auf subscribe result; ignoriere method-Zeilen
+    time_t t0=time(NULL); char line[16384];
+    while (time(NULL)-t0 < 5) {
+        recv_into_buffer(C->sock, 500);
+        while (next_line(line,sizeof line)) {
+            if (strstr(line,"\"result\"") && !strstr(line,"\"method\"")) {
+                if (parse_subscribe_result(line, C->extranonce1, sizeof C->extranonce1, &C->extranonce2_size)) {
+                    goto have_extranonce;
+                }
+            }
+        }
+    }
+have_extranonce:
+    if (!C->extranonce1[0]) snprintf(C->extranonce1,sizeof C->extranonce1,"00000000");
+    if (!C->extranonce2_size) C->extranonce2_size = 4;
+
+    // Authorize
+    char auth[512];
+    snprintf(auth,sizeof auth,"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}\n",C->wallet,C->pass);
+    if(!send_line(C->sock,auth)) return 0;
+
+    // Erstes Rauschen abholen
+    t0=time(NULL);
+    while (time(NULL)-t0 < 2) { recv_into_buffer(C->sock, 200); while(next_line(line,sizeof line)){} }
+
+    printf("Connected to %s:%d\nExtranonce1=%s, extranonce2_size=%u\n",
+           C->host,C->port,C->extranonce1,C->extranonce2_size);
+    return 1;
+}
+
 static int get_next_quoted(const char *pp, const char *end, char *out, size_t cap) {
     const char *p = pp, *q1=NULL,*q2=NULL;
     for (; p < end; p++){ if(*p=='"'){ q1=p; break; } }
@@ -171,19 +245,6 @@ static int get_next_quoted(const char *pp, const char *end, char *out, size_t ca
     if (!q2) return 0;
     size_t L=(size_t)(q2-(q1+1)); if (L>=cap) L=cap-1;
     memcpy(out,q1+1,L); out[L]=0; return 1;
-}
-static int get_nth_quoted(const char *pp, const char *end, int n, char *out, size_t cap){
-    const char *p = pp; int k=0;
-    while (p<end && k<=n) {
-        const char *q1 = strchr(p,'"'); if(!q1||q1>=end) return 0;
-        const char *q2 = strchr(q1+1,'"'); if(!q2||q2>=end) return 0;
-        if (k==n) {
-            size_t L=(size_t)(q2-(q1+1)); if(L>=cap) L=cap-1;
-            memcpy(out,q1+1,L); out[L]=0; return 1;
-        }
-        p = q2+1; k++;
-    }
-    return 0;
 }
 
 static int stratum_parse_notify(const char *line, stratum_job_t *J){
@@ -212,73 +273,13 @@ static int stratum_parse_notify(const char *line, stratum_job_t *J){
         p = m_rb+1;
     }
 
-    // version, nbits, ntime (als hex in Strings)
+    // version, nbits, ntime (als hex-Strings)
     char vhex[16]={0}, nbhex[16]={0}, nth[16]={0};
     if(!get_next_quoted(p,rb,vhex,sizeof vhex)) return 0; sscanf(vhex,"%x",&J->version);
     if(!get_next_quoted(p,rb,nbhex,sizeof nbhex)) return 0; sscanf(nbhex,"%x",&J->nbits);
     if(!get_next_quoted(p,rb,nth,sizeof nth))    return 0; sscanf(nth,"%x",&J->ntime);
 
     J->clean = strstr(p,"true")!=NULL;
-    return 1;
-}
-
-static void stratum_parse_subscribe_result(const char *line, char *ex1, size_t ex1cap, uint32_t *ex2sz) {
-    // Sehr simpel: nimm die zweite gequotete Zeichenkette als extranonce1 und
-    // die letzte Ganzzahl in der result-Liste als extranonce2_size.
-    const char *res = strstr(line,"\"result\"");
-    if(!res) return;
-    const char *lb = strchr(res,'['); const char *rb = lb?strchr(lb,']'):NULL;
-    if(!lb || !rb) return;
-    char tmp[256];
-    if (get_nth_quoted(lb,rb,1,tmp,sizeof tmp)) snprintf(ex1,ex1cap,"%s",tmp);
-    // letzte Zahl suchen
-    const char *p = rb-1; while (p>lb && (*p<'0'||*p>'9')) p--;
-    const char *q = p; while (q>lb && *(q-1)>='0' && *(q-1)<='9') q--;
-    if (q>=lb && p>=q) {
-        char num[32]; size_t L=(size_t)(p-q+1); if (L>31) L=31;
-        memcpy(num,q,L); num[L]=0;
-        unsigned long v = strtoul(num,NULL,10);
-        if (v>0 && v<=16) *ex2sz = (uint32_t)v;
-    }
-}
-
-static int stratum_connect(stratum_ctx_t *C,const char *host,int port,const char *user,const char *pass){
-    memset(C,0,sizeof *C);
-    snprintf(C->host,sizeof C->host,"%s",host); C->port=port;
-    snprintf(C->wallet,sizeof C->wallet,"%s",user);
-    snprintf(C->pass,sizeof C->pass,"%s",pass);
-    C->sock = sock_connect(host,port); if (C->sock<0) return 0;
-
-    char sub[256];
-    snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/0.3\"]}\n");
-    if(!send_line(C->sock,sub)) return 0;
-
-    // Warte auf subscribe result (ignoriere method-Messages in der Zeit)
-    time_t t0=time(NULL); char line[8192];
-    while (time(NULL)-t0 < 5) {
-        recv_into_buffer(C->sock, 500);
-        while (next_line(line,sizeof line)) {
-            if (strstr(line,"\"result\"") && !strstr(line,"\"method\"")) {
-                // subscribe result
-                stratum_parse_subscribe_result(line, C->extranonce1, sizeof C->extranonce1, &C->extranonce2_size);
-            }
-            if (C->extranonce1[0] && C->extranonce2_size) goto have_extranonce;
-        }
-    }
-have_extranonce:
-    if (!C->extranonce1[0]) snprintf(C->extranonce1,sizeof C->extranonce1,"00000000");
-    if (!C->extranonce2_size) C->extranonce2_size = 4;
-
-    char auth[512];
-    snprintf(auth,sizeof auth,"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}\n",C->wallet,C->pass);
-    if(!send_line(C->sock,auth)) return 0;
-
-    // Konsumiere erste paar Zeilen (diff/notify)
-    t0=time(NULL);
-    while (time(NULL)-t0 < 3) { recv_into_buffer(C->sock, 200); while(next_line(line,sizeof line)){} }
-
-    printf("Connected to %s:%d\nExtranonce1=%s, extranonce2_size=%u\n",
-           C->host,C->port,C->extranonce1,C->extranonce2_size);
     return 1;
 }
 
@@ -289,7 +290,7 @@ static int stratum_get_job(stratum_ctx_t *C, stratum_job_t *J){
         if (strstr(line,"\"mining.notify\"")) {
             if (stratum_parse_notify(line,J)) { got=1; break; }
         }
-        // andere Methoden ignorieren (set_difficulty etc.)
+        // set_difficulty & friends ignorieren
     }
     return got;
 }
@@ -340,6 +341,13 @@ static char* load_kernel_source(const char *path) {
 }
 
 // ============================== MAIN ============================
+
+// Monotonic ms
+static inline uint64_t mono_ms(void){
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec*1000ull + (uint64_t)ts.tv_nsec/1000000ull;
+}
+
 int main(int argc, char **argv) {
     // Speicher (MB) -> Blöcke
     uint32_t m_cost_kb = 64*1024;
@@ -372,14 +380,13 @@ int main(int argc, char **argv) {
     size_t m_bytes = (size_t)m_cost_kb * 1024;
     cl_mem d_mem   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,m_bytes,NULL,&err);
     cl_mem d_phash = clCreateBuffer(ctx,CL_MEM_READ_ONLY, 32,NULL,&err);
-    cl_mem d_out   = clCreateBuffer(ctx,CL_MEM_WRITE_ONLY,32,NULL,&err);
+    cl_mem d_out   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,32,NULL,&err); // RW wegen atomics
 
-    // Kernel-Args setzen
+    // Kernel-Args setzen (statische)
     clSetKernelArg(krn,0,sizeof(d_phash), &d_phash);
     clSetKernelArg(krn,1,sizeof(d_mem),   &d_mem);
     clSetKernelArg(krn,2,sizeof(uint32_t),&m_cost_kb);
-    clSetKernelArg(krn,7,sizeof(d_out),   &d_out);  // ACHTUNG: Position 7 = output
-    // Arg 3..6 und 8 setzen wir pro Dispatch
+    clSetKernelArg(krn,7,sizeof(d_out),   &d_out);  // output (32B)
 
     // Stratum
     stratum_ctx_t S; if(!stratum_connect(&S,POOL,PORT,WAL,PASS)){ fprintf(stderr,"Stratum connect failed\n"); return 1; }
@@ -388,20 +395,25 @@ int main(int argc, char **argv) {
     stratum_job_t J={0}, Jnew={0}; int have_job=0;
 
     // Mining Loop
-    time_t last_stat=time(NULL); uint64_t hashes=0;
+    uint64_t hashes_window = 0;
+    uint64_t t_print = mono_ms();   // nächster Print-Zeitpunkt
+    uint64_t t_poll  = mono_ms();   // nächster Stratum-Poll
 
     while (1) {
-        // Netzwerk pumpen
-        recv_into_buffer(S.sock, 20);
-
-        // === Job holen (non-blocking, komplette Zeilen) ===
-        while (stratum_get_job(&S, &Jnew)) {
-            J = Jnew; have_job = 1;
-            uint8_t prev_be[32];
-            hex2bin(J.prevhash_hex, prev_be, 32);
-            for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be[31 - i];
-            target_from_nbits(J.nbits, target_be);
-            printf("Job %s ready. nbits=%08x ntime=%08x\n", J.job_id, J.nbits, J.ntime);
+        // Netzwerk pumpen in moderater Kadenz
+        if (mono_ms() - t_poll >= 100) {
+            recv_into_buffer(S.sock, 0);
+            // neue Jobs ziehen – aber Nonce-Loop nicht ständig abbrechen
+            while (stratum_get_job(&S, &Jnew)) {
+                if (!have_job || strcmp(Jnew.job_id, J.job_id) != 0 || Jnew.clean) {
+                    J = Jnew; have_job = 1;
+                    uint8_t prev_be[32]; hex2bin(J.prevhash_hex, prev_be, 32);
+                    for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be[31 - i];
+                    target_from_nbits(J.nbits, target_be);
+                    printf("Job %s ready. nbits=%08x ntime=%08x\n", J.job_id, J.nbits, J.ntime);
+                }
+            }
+            t_poll = mono_ms();
         }
         if (!have_job) { usleep(10000); continue; }
 
@@ -415,42 +427,41 @@ int main(int argc, char **argv) {
         size_t en1b = strlen(S.extranonce1) / 2; if (en1b > 64) en1b = 64;
         hex2bin(S.extranonce1, en1, en1b);
 
-        // === extranonce2 ===
         static uint32_t en2_counter = 1;
         char en2_hex[64];
         snprintf(en2_hex, sizeof en2_hex, "%0*x", S.extranonce2_size * 2, en2_counter++);
         uint8_t en2[64]; hex2bin(en2_hex, en2, S.extranonce2_size);
 
-        // === coinbase zusammenbauen ===
         uint8_t coinbase[8192]; size_t off = 0;
         memcpy(coinbase + off, coinb1, cb1); off += cb1;
         memcpy(coinbase + off, en1, en1b); off += en1b;
         memcpy(coinbase + off, en2, S.extranonce2_size); off += S.extranonce2_size;
         memcpy(coinbase + off, coinb2, cb2); off += cb2;
 
-        // === coinbase hash ===
         uint8_t cbh_be[32]; double_sha256(coinbase, off, cbh_be);
-
-        // === Merkle-Root ===
         build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
 
         // === Nonce-Range ===
         const uint32_t NONCES_PER_ITER = 20000;
         for (uint32_t nonce = 0; nonce < NONCES_PER_ITER; nonce++) {
-            // Header bauen
+            // Header
             uint8_t header[80];
             build_header_le(&J, prevhash_le, merkleroot_le, J.ntime, J.nbits, nonce, header);
 
             // BLAKE3 -> prehash32
             uint8_t prehash[32]; blake3_hash32(header, 80, prehash);
 
-            // Asynchron schreiben, nur auf diesen Transfer warten
+            // d_out nullen (für atomare XOR-Reduktion im Kernel)
+            static const uint8_t zero32[32] = {0};
+            clEnqueueWriteBuffer(q, d_out, CL_FALSE, 0, 32, zero32, 0, NULL, NULL);
+
+            // Prehash schreiben (nur auf diesen Transfer warten)
             cl_event write_ev;
             clEnqueueWriteBuffer(q, d_phash, CL_FALSE, 0, 32, prehash, 0, NULL, &write_ev);
             clWaitForEvents(1, &write_ev);
             clReleaseEvent(write_ev);
 
-            // Argon2d: pass/slice/chunks
+            // Argon2d: pass/slice/chunks → ein Work-Item pro Block
             for (uint32_t pass = 0; pass < T_COST; pass++) {
                 for (uint32_t slice = 0; slice < 4; slice++) {
                     const uint32_t slice_begin = slice * (m_cost_kb / 4);
@@ -459,14 +470,12 @@ int main(int argc, char **argv) {
                         uint32_t end = start + CHUNK_BLOCKS; if (end > slice_end) end = slice_end;
                         const uint32_t do_init = (pass == 0 && slice == 0 && start == 0) ? 1U : 0U;
 
-                        // Kernel-Args setzen
                         clSetKernelArg(krn, 3, sizeof(uint32_t), &pass);
                         clSetKernelArg(krn, 4, sizeof(uint32_t), &slice);
                         clSetKernelArg(krn, 5, sizeof(uint32_t), &start);
                         clSetKernelArg(krn, 6, sizeof(uint32_t), &end);
                         clSetKernelArg(krn, 8, sizeof(uint32_t), &do_init);
 
-                        // WICHTIG: G = end - start  (ein Work-Item pro Block)
                         size_t G = (size_t)(end - start);
                         err = clEnqueueNDRangeKernel(q, krn, 1, NULL, &G, NULL, 0, NULL, NULL);
                         if (err != CL_SUCCESS) { fprintf(stderr, "Kernel failed: %d\n", err); break; }
@@ -474,10 +483,9 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-            // Synchronisation erst NACH allen Chunks/Pass/Slice
             clFinish(q);
 
-            // SHA3-256 over GPU-out
+            // SHA3-256 über GPU-out
             uint8_t argon_out[32]; clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32, argon_out, 0, NULL, NULL);
             uint8_t final_hash[32]; sha3_256(argon_out, 32, final_hash);
 
@@ -495,42 +503,40 @@ int main(int argc, char **argv) {
                 }
             }
 
-            hashes++;
+            hashes_window++;  // zählt Nonces
 
-            // Stats & neue Jobs (ge-drosselt)
-            if ((nonce % 1000) == 0) {
-                static struct timespec last_poll = {0, 0};
-                struct timespec nowts;
-                clock_gettime(CLOCK_MONOTONIC, &nowts);
-                long diff_ms = (nowts.tv_sec - last_poll.tv_sec) * 1000L
-                             + (nowts.tv_nsec - last_poll.tv_nsec) / 1000000L;
-                if (diff_ms >= 100) {
-                    while (stratum_get_job(&S, &Jnew)) {
-                        if (strcmp(Jnew.job_id, J.job_id) != 0 || Jnew.clean) {
-                            J = Jnew;
-                            uint8_t prev_be2[32]; hex2bin(J.prevhash_hex, prev_be2, 32);
-                            for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be2[31 - i];
-                            target_from_nbits(J.nbits, target_be);
-                            printf("\nSwitch to job %s\n", J.job_id);
-                            break;
-                        }
+            // periodischer Status (5s Fenster, monotonic)
+            uint64_t now = mono_ms();
+            if (now - t_print >= 5000) {
+                double secs = (now - t_print) / 1000.0;
+                double rate = hashes_window / secs;
+                printf("Hashrate: %.1f H/s | Job: %s\r", rate, J.job_id[0]?J.job_id:"-");
+                fflush(stdout);
+                t_print = now;
+                hashes_window = 0;
+            }
+
+            // sanftes Stratum-Polling ohne die Schleife zu zerhacken
+            if ((nonce % 1000) == 0 && mono_ms() - t_poll >= 100) {
+                recv_into_buffer(S.sock, 0);
+                stratum_job_t Jtmp;
+                while (stratum_get_job(&S, &Jtmp)) {
+                    // Nur bei clean oder neuer ID umschalten
+                    if (strcmp(Jtmp.job_id, J.job_id) != 0 || Jtmp.clean) {
+                        J = Jtmp;
+                        uint8_t prev_be2[32]; hex2bin(J.prevhash_hex, prev_be2, 32);
+                        for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be2[31 - i];
+                        target_from_nbits(J.nbits, target_be);
+                        printf("\nSwitch to job %s\n", J.job_id);
+                        break;
                     }
-                    last_poll = nowts;
                 }
-
-                time_t now = time(NULL);
-                if (now - last_stat >= 10) {
-                    double rate = (double)hashes / (double)(now - last_stat);
-                    printf("Hashrate: %.1f H/s | Job: %s\r", rate, J.job_id);
-                    fflush(stdout);
-                    last_stat = now;
-                    hashes = 0;
-                }
+                t_poll = mono_ms();
             }
         } // for nonce
 
         // Kurze Pause um CPU zu entlasten
-        usleep(10000);
+        usleep(5000);
     } // while (1)
 
     // ===== Cleanup =====
@@ -545,3 +551,4 @@ int main(int argc, char **argv) {
     close(S.sock);
     return 0;
 }
+
