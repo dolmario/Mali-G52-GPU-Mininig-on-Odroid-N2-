@@ -356,9 +356,10 @@ int main(int argc, char **argv) {
     // === Job holen (non-blocking) ===
     if (stratum_get_job(&S, &Jnew)) {
         J = Jnew; have_job = 1;
-        uint8_t prev_be[32]; hex2bin(J.prevhash_hex, prev_be, 32);
-        for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be[31 - i];
-        target_from_nbits(J.nbits, target_be);
+        uint8_t prev_be[32];
+        hex2bin(J.prevhash_hex, prev_be, 32);             // prevhash BE→bin
+        for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be[31 - i]; // bin LE
+        target_from_nbits(J.nbits, target_be);            // BE-Target
         printf("Job %s ready. nbits=%08x ntime=%08x\n", J.job_id, J.nbits, J.ntime);
     }
     if (!have_job) { usleep(100000); continue; }
@@ -368,53 +369,52 @@ int main(int argc, char **argv) {
     size_t cb1 = strlen(J.coinb1_hex) / 2, cb2 = strlen(J.coinb2_hex) / 2;
     hex2bin(J.coinb1_hex, coinb1, cb1);
     hex2bin(J.coinb2_hex, coinb2, cb2);
-    uint8_t en1[64]; size_t en1b = strlen(S.extranonce1) / 2; if (en1b > 64) en1b = 64;
+
+    uint8_t en1[64];
+    size_t en1b = strlen(S.extranonce1) / 2; if (en1b > 64) en1b = 64;
     hex2bin(S.extranonce1, en1, en1b);
 
-    // === extranonce2 bauen ===
+    // === extranonce2 ===
     static uint32_t en2_counter = 1;
     char en2_hex[64];
     snprintf(en2_hex, sizeof en2_hex, "%0*x", S.extranonce2_size * 2, en2_counter++);
     uint8_t en2[64]; hex2bin(en2_hex, en2, S.extranonce2_size);
 
-    // === Coinbase = coinb1 + en1 + en2 + coinb2 ===
+    // === coinbase = coinb1 + en1 + en2 + coinb2 ===
     uint8_t coinbase[4096]; size_t off = 0;
-    memcpy(coinbase + off, coinb1, cb1); off += cb1;
-    memcpy(coinbase + off, en1, en1b);   off += en1b;
-    memcpy(coinbase + off, en2, S.extranonce2_size); off += S.extranonce2_size;
-    memcpy(coinbase + off, coinb2, cb2); off += cb2;
+    memcpy(coinbase + off, coinb1, cb1);                 off += cb1;
+    memcpy(coinbase + off, en1, en1b);                   off += en1b;
+    memcpy(coinbase + off, en2, S.extranonce2_size);     off += S.extranonce2_size;
+    memcpy(coinbase + off, coinb2, cb2);                 off += cb2;
 
-    // === Coinbase Hash (double-SHA256, BE) ===
+    // === coinbase hash (double-SHA256, BE) ===
     uint8_t cbh_be[32]; double_sha256(coinbase, off, cbh_be);
 
-    // === Merkle-Root in LE ===
+    // === Merkle-Root LE ===
     build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
 
-    // === Nonce-Range (klein halten wegen Mali-Watchdog) ===
+    // === Nonce-Range (klein wegen Mali-Watchdog) ===
     const uint32_t NONCES_PER_ITER = 20000;
     for (uint32_t nonce = 0; nonce < NONCES_PER_ITER; nonce++) {
-        // --- Header bauen ---
+        // Header LE bauen
         uint8_t header[80];
         build_header_le(&J, prevhash_le, merkleroot_le, J.ntime, J.nbits, nonce, header);
 
-        // --- Prehash (BLAKE3) ---
+        // Schritt 1: BLAKE3
         uint8_t prehash[32]; blake3_hash32(header, 80, prehash);
         clEnqueueWriteBuffer(q, d_phash, CL_TRUE, 0, 32, prehash, 0, NULL, NULL);
 
-        // --- Argon2d: Passes + Slices + Chunks ---
+        // Schritt 2: Argon2d (Passes, Slices, Chunks)
         size_t G = 1;
         for (uint32_t pass = 0; pass < T_COST; pass++) {
             for (uint32_t slice = 0; slice < 4; slice++) {
-                for (uint32_t start = slice * (m_cost_kb / 4);
-                     start < (slice + 1) * (m_cost_kb / 4);
-                     start += CHUNK_BLOCKS)
-                {
-                    uint32_t end = start + CHUNK_BLOCKS;
-                    if (end > (slice + 1) * (m_cost_kb / 4))
-                        end = (slice + 1) * (m_cost_kb / 4);
+                const uint32_t slice_begin = slice * (m_cost_kb / 4);
+                const uint32_t slice_end   = (slice + 1) * (m_cost_kb / 4);
+                for (uint32_t start = slice_begin; start < slice_end; start += CHUNK_BLOCKS) {
+                    uint32_t end = start + CHUNK_BLOCKS; if (end > slice_end) end = slice_end;
+                    const uint32_t do_init = (pass == 0 && slice == 0 && start == 0) ? 1U : 0U;
 
-                    uint32_t do_init = (pass == 0 && slice == 0 && start == 0) ? 1U : 0U;
-
+                    // Kernel-Args: 0:d_phash,1:d_mem,2:m_cost_kb,3:pass,4:slice,5:start,6:end,7:d_out,8:do_init
                     clSetKernelArg(krn, 3, sizeof(uint32_t), &pass);
                     clSetKernelArg(krn, 4, sizeof(uint32_t), &slice);
                     clSetKernelArg(krn, 5, sizeof(uint32_t), &start);
@@ -429,11 +429,11 @@ int main(int argc, char **argv) {
         }
         clFinish(q);
 
-        // --- Ergebnis 32B holen und finalisieren ---
+        // Schritt 3: SHA3-256(final)
         uint8_t argon_out[32]; clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32, argon_out, 0, NULL, NULL);
         uint8_t final_hash[32]; sha3_256(argon_out, 32, final_hash);
 
-        // --- Target-Vergleich (BE) ---
+        // Target-Vergleich (BE)
         int ok = 1;
         for (int i = 0; i < 32; i++) {
             if (final_hash[i] < target_be[i]) { ok = 1; break; }
@@ -449,7 +449,7 @@ int main(int argc, char **argv) {
 
         hashes++;
 
-                // --- Stats & neue Jobs ---
+        // Stats & neue Jobs
         if ((nonce % 1000) == 0) {
             stratum_job_t tmp;
             if (stratum_get_job(&S, &tmp)) {
@@ -459,7 +459,7 @@ int main(int argc, char **argv) {
                     for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be2[31 - i];
                     target_from_nbits(J.nbits, target_be);
                     printf("\nSwitch to job %s\n", J.job_id);
-                    break;
+                    break; // neue coinbase in nächster Schleife
                 }
             }
             time_t now = time(NULL);
@@ -467,21 +467,22 @@ int main(int argc, char **argv) {
                 double rate = (double)hashes / (double)(now - last_stat);
                 printf("Hashrate: %.1f H/s | Job: %s\r", rate, J.job_id);
                 fflush(stdout);
-                last_stat = now; hashes = 0;
+                last_stat = now;
+                hashes = 0;
             }
         }
     }
-
-    // === Cleanup (normal nicht erreicht) ===
-    clReleaseMemObject(d_mem);
-    clReleaseMemObject(d_phash);
-    clReleaseMemObject(d_out);
-    clReleaseKernel(krn);
-    clReleaseProgram(prog);
-    clReleaseCommandQueue(q);
-    clReleaseContext(ctx);
-    free(ksrc);
-    close(S.sock);
-
-    return 0;
 }
+
+// ===== Cleanup (innerhalb von main!) =====
+clReleaseMemObject(d_mem);
+clReleaseMemObject(d_phash);
+clReleaseMemObject(d_out);
+clReleaseKernel(krn);
+clReleaseProgram(prog);
+clReleaseCommandQueue(q);
+clReleaseContext(ctx);
+free(ksrc);
+close(S.sock);
+return 0;
+} 
