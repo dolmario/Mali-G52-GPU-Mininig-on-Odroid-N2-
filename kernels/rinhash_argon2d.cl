@@ -51,11 +51,13 @@ __kernel void argon2d_core(__global const uchar *prehash32,
             for (int i = 0; i < ARGON2_QWORDS_IN_BLOCK; i++)
                 state[i] = prev[i] ^ ((ulong)idx * 0x9e3779b97f4a7c15UL);
 
+            /*
             // Debug nur beim allerersten Arbeitsblock
             if (pass == 0 && idx == 1) {
                 printf("DEBUG Prehash[0]=%02x\n", prehash32[0]);
                 printf("DEBUG Seed[0]=%llu\n", (ulong)state[0]);
             }
+            */
 
             // 2 Runden BLAKE2-Mix (MVP – echt: mehr + Kompression)
             for (int r = 0; r < 2; r++)
