@@ -626,7 +626,7 @@ int main(int argc, char **argv) {
    // Speicher: 64 KiB
    size_t m_bytes = (size_t)m_cost_kb * 1024;
    cl_mem d_mem   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,m_bytes,NULL,&err);
-   cl_mem d_phash = clCreateBuffer(ctx,CL_MEM_READ_ONLY, 32,NULL,&err);
+   cl_mem d_phash = clCreateBuffer(ctx,CL_MEM_READ_ONLY, 80,NULL,&err);
    cl_mem d_out   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,32,NULL,&err);
 
    // ===== Stratum =====
@@ -701,7 +701,7 @@ int main(int argc, char **argv) {
 
            // Prehash schreiben (Warte nur auf diesen Transfer)
            cl_event write_ev;
-           clEnqueueWriteBuffer(q, d_phash, CL_FALSE, 0, 32, prehash, 0, NULL, &write_ev);
+           clEnqueueWriteBuffer(q, d_phash, CL_FALSE, 0, 80, header, 0, NULL, &write_ev);
            clWaitForEvents(1, &write_ev);
            clReleaseEvent(write_ev);
 
