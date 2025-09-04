@@ -69,8 +69,10 @@ static int g_diff_locked = 0;
 static uint64_t g_total_hashes = 0;
 static uint32_t g_best_leading_zeros = 0;
 
-// Time rolling for Zergpool compliance
+// Time rolling
 static uint32_t g_batch_counter = 0;
+static uint32_t g_submit_base = 0;
+static uint64_t g_job_start_ms = 0;
 
 // ============================ Utils ==============================
 static void blake3_hash32(const uint8_t *in, size_t len, uint8_t out[32]) {
@@ -317,7 +319,19 @@ static int next_line(char *out, size_t cap) {
     return 0;
 }
 
-// Subscribe parsing
+// Subscribe parsing helper (advance pointer)
+static int next_quoted(const char **pp, const char *end, char *out, size_t cap) {
+    const char *p = *pp, *q1 = NULL, *q2 = NULL;
+    for (; p < end; p++) if (*p == '"') { q1 = p; break; }
+    if (!q1) return 0;
+    for (p = q1 + 1; p < end; p++) if (*p == '"') { q2 = p; break; }
+    if (!q2) return 0;
+    size_t L = (size_t)(q2 - (q1 + 1)); if (L >= cap) L = cap - 1;
+    memcpy(out, q1 + 1, L); out[L] = 0;
+    *pp = q2 + 1;
+    return 1;
+}
+
 static const char* find_after_result_array_first(const char *s) {
     const char *p = strstr(s, "\"result\""); if (!p) return NULL;
     p = strchr(p, '['); if (!p) return NULL;
@@ -455,16 +469,6 @@ static int stratum_connect_any(stratum_ctx_t *C, const char **hosts, int port, c
     return 0;
 }
 
-static int get_next_quoted(const char *pp, const char *end, char *out, size_t cap) {
-    const char *p = pp, *q1=NULL,*q2=NULL;
-    for (; p < end; p++){ if(*p=='"'){ q1=p; break; } }
-    if (!q1) return 0;
-    for (p=q1+1; p<end; p++){ if(*p=='"'){ q2=p; break; } }
-    if (!q2) return 0;
-    size_t L=(size_t)(q2-(q1+1)); if (L>=cap) L=cap-1;
-    memcpy(out,q1+1,L); out[L]=0; return 1;
-}
-
 static int stratum_parse_notify(const char *line, stratum_job_t *J){
     if (!strstr(line,"\"mining.notify\"")) return 0;
     memset(J,0,sizeof *J);
@@ -472,29 +476,38 @@ static int stratum_parse_notify(const char *line, stratum_job_t *J){
     const char *lb = strchr(pp,'['); const char *rb = lb?strrchr(pp,']'):NULL;
     if(!lb||!rb||rb<=lb) return 0;
     const char *p = lb+1;
-    if(!get_next_quoted(p,rb,J->job_id,sizeof J->job_id)) return 0;
-    if(!get_next_quoted(p,rb,J->prevhash_hex,sizeof J->prevhash_hex)) return 0;
-    if(!get_next_quoted(p,rb,J->coinb1_hex,sizeof J->coinb1_hex)) return 0;
-    if(!get_next_quoted(p,rb,J->coinb2_hex,sizeof J->coinb2_hex)) return 0;
+
+    if(!next_quoted(&p,rb,J->job_id,sizeof J->job_id)) return 0;
+    if(!next_quoted(&p,rb,J->prevhash_hex,sizeof J->prevhash_hex)) return 0;
+    if(!next_quoted(&p,rb,J->coinb1_hex,sizeof J->coinb1_hex)) return 0;
+    if(!next_quoted(&p,rb,J->coinb2_hex,sizeof J->coinb2_hex)) return 0;
 
     J->merkle_count = 0;
+    // Parse merkle array
     const char *m_lb=strchr(p,'['), *m_rb=NULL;
-    if (m_lb) { const char *scan=m_lb+1; for(;scan<rb;scan++){ if(*scan==']'){ m_rb=scan; break; }}}
+    if (m_lb) {
+        int depth=0;
+        const char *scan=m_lb;
+        for (; scan<rb; scan++){
+            if (*scan=='[') depth++;
+            else if (*scan==']') { depth--; if (depth==0){ m_rb=scan; break; } }
+        }
+    }
     if (m_lb && m_rb && m_rb>m_lb) {
         const char *mp = m_lb+1;
         while (J->merkle_count < 16) {
-            char tmp[65]; if(!get_next_quoted(mp,m_rb,tmp,sizeof tmp)) break;
+            char tmp[65];
+            if(!next_quoted(&mp, m_rb, tmp, sizeof tmp)) break;
             snprintf(J->merkle_hex[J->merkle_count],65,"%s",tmp);
             J->merkle_count++;
-            mp = strchr(mp+1,'"'); if(!mp) break;
         }
         p = m_rb+1;
     }
 
     char vhex[16]={0}, nbhex[16]={0}, nth[16]={0};
-    if(!get_next_quoted(p,rb,vhex,sizeof vhex)) return 0; sscanf(vhex,"%x",&J->version);
-    if(!get_next_quoted(p,rb,nbhex,sizeof nbhex)) return 0; sscanf(nbhex,"%x",&J->nbits);
-    if(!get_next_quoted(p,rb,nth,sizeof nth))    return 0; sscanf(nth,"%x",&J->ntime);
+    if(!next_quoted(&p,rb,vhex,sizeof vhex)) return 0; sscanf(vhex,"%x",&J->version);
+    if(!next_quoted(&p,rb,nbhex,sizeof nbhex)) return 0; sscanf(nbhex,"%x",&J->nbits);
+    if(!next_quoted(&p,rb,nth,sizeof nth))     return 0; sscanf(nth,"%x",&J->ntime);
 
     J->clean = strstr(p,"true")!=NULL;
     return 1;
@@ -543,6 +556,17 @@ static int stratum_submit(stratum_ctx_t *C,const stratum_job_t *J,
     size_t n = build_submit_json(req, sizeof req, C->wallet, J->job_id, extranonce2_hex, ntime_le, nonce_le);
     if (n == 0 || n >= sizeof req) { fprintf(stderr,"submit snprintf overflow\n"); return 0; }
     int ok = send_line_verbose(C->sock,req);
+    if (ok) stratum_wait_submit_ack(C->sock);
+    return ok;
+}
+
+// submit using explicit job_id string (nonce-bound job id)
+static int stratum_submit_with_jobid(stratum_ctx_t *C, const char *job_id,
+                                     const char *extranonce2_hex, uint32_t ntime_le, uint32_t nonce_le) {
+    char req[1536];
+    size_t n = build_submit_json(req, sizeof req, C->wallet, job_id, extranonce2_hex, ntime_le, nonce_le);
+    if (n == 0 || n >= sizeof req) { fprintf(stderr,"submit snprintf overflow\n"); return 0; }
+    int ok = send_line_verbose(C->sock, req);
     if (ok) stratum_wait_submit_ack(C->sock);
     return ok;
 }
@@ -601,7 +625,7 @@ static char* load_kernel_source(const char *filename) {
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int sig){ (void)sig; g_stop = 1; }
 
-// Mali-G52 robust kernel arg setter - NO DEBUG SPAM
+// Mali-G52 robust kernel arg setter
 static int set_batch_kernel_args_adaptive(cl_kernel k_batch,
                                           cl_mem d_prehash, cl_mem d_mem, cl_mem d_out,
                                           cl_uint num_items, cl_uint blocks_per_lane) {
@@ -667,7 +691,7 @@ int main(int argc, char **argv) {
     const char *WAL  = wallet_env && wallet_env[0] ? wallet_env : DEFAULT_WAL;
     const char *PASS = pass_env   && pass_env[0]   ? pass_env   : DEFAULT_PASS;
 
-    // Parse d= or sd= from POOL_PASS to properly set g_diff_locked
+    // Parse d= or sd= from POOL_PASS
     double pdiff = 0.0;
     int locked = 0;
     if (parse_diff_from_pass(PASS, &pdiff, &locked) && pdiff > 0.0) {
@@ -808,6 +832,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // store job_id per nonce for the current batch
+    char *job_id_per_nonce = (char*)malloc((size_t)BATCH * 128u);
+    if (!job_id_per_nonce) {
+        fprintf(stderr, "malloc job_id_per_nonce failed\n");
+        return 1;
+    }
+
     // Stratum
     int PORT = getenv("POOL_PORT") ? atoi(getenv("POOL_PORT")) : PORT_DEFAULT;
     stratum_ctx_t S;
@@ -857,7 +888,14 @@ int main(int argc, char **argv) {
                         nonce_base = 0;
                         extranonce2_counter = 1;
                         debug_shown_for_job = 0;
-                        g_batch_counter = 0;  // Reset time rolling counter
+
+                        // reset rolling per job
+                        g_batch_counter = 0;
+                        uint32_t now = (uint32_t)time(NULL);
+                        g_submit_base = (J.ntime > now - 60 && J.ntime < now + 120) ? J.ntime : now;
+                        g_submit_base -= (g_submit_base % 16); // optional: align to 16s
+                        g_job_start_ms = mono_ms();
+
                         printf("New Job id %s\n", J.job_id);
                     }
                 }
@@ -889,7 +927,7 @@ int main(int argc, char **argv) {
         uint8_t coinbase[8192];
         size_t off = 0;
         memcpy(coinbase + off, coinb1, cb1); off += cb1;
-        memcpy(coinbase + off, en1, en1b); off += en1b;
+        memcpy(coinbase + off, en1, en1b);   off += en1b;
         memcpy(coinbase + off, en2, S.extranonce2_size); off += S.extranonce2_size;
         memcpy(coinbase + off, coinb2, cb2); off += cb2;
 
@@ -899,13 +937,22 @@ int main(int argc, char **argv) {
         uint8_t merkleroot_le[32];
         build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
 
+        // === Time rolling: header_ntime == submit_ntime ===
+        uint32_t submit_ntime = g_submit_base + (g_batch_counter % 15); // 0..14
+        uint32_t header_ntime = submit_ntime;
+
         // Header+BLAKE3 for BATCH Nonces
-        uint32_t ntime_le = J.ntime;
+        char current_job_id[128];
+        snprintf(current_job_id, sizeof current_job_id, "%s", J.job_id);
+
         for (cl_uint i = 0; i < BATCH; i++) {
             uint32_t nonce = nonce_base + i;
             uint8_t header[80];
-            build_header_le(&J, prevhash_le, merkleroot_le, ntime_le, J.nbits, nonce, header);
+            build_header_le(&J, prevhash_le, merkleroot_le, header_ntime, J.nbits, nonce, header);
             blake3_hash32(header, 80, &h_prehash[i * 32]);
+
+            // store job_id for this nonce (freeze against later job switches)
+            snprintf(&job_id_per_nonce[i * 128], 128, "%s", current_job_id);
         }
         nonce_base += BATCH;
 
@@ -922,17 +969,11 @@ int main(int argc, char **argv) {
         uint64_t t0 = mono_ms();
 
         int used_batch = 0;
+        cl_kernel k_exec = NULL;
         if (have_batch) {
-            err = set_batch_kernel_args_adaptive(k_batch, d_prehash, d_mem, d_out, BATCH, blocks_per_lane);
-            if (err == CL_SUCCESS) {
-                err = clEnqueueNDRangeKernel(q, k_batch, 1, NULL, &global, NULL, 0, NULL, NULL);
-                if (err == CL_SUCCESS) {
-                    used_batch = 1;
-                } else {
-                    fprintf(stderr, "clEnqueueNDRangeKernel(batch)=%d\n", err);
-                }
-            } else {
-                fprintf(stderr, "clSetKernelArg(batch)=%d\n", err);
+            if (set_batch_kernel_args_adaptive(k_batch, d_prehash, d_mem, d_out, BATCH, blocks_per_lane) == CL_SUCCESS &&
+                clEnqueueNDRangeKernel(q, k_batch, 1, NULL, &global, NULL, 0, NULL, NULL) == CL_SUCCESS) {
+                used_batch = 1;
             }
         }
         if (!used_batch) {
@@ -958,11 +999,13 @@ int main(int argc, char **argv) {
                 return 1;
             }
             size_t one = 1;
-            err = clEnqueueNDRangeKernel(q, k_single, 1, NULL, &one, NULL, 0, NULL, NULL);
-            if (err != CL_SUCCESS) {
-                fprintf(stderr, "clEnqueueNDRangeKernel(single)=%d\n", err);
+            if (clEnqueueNDRangeKernel(q, k_single, 1, NULL, &one, NULL, 0, NULL, NULL) != CL_SUCCESS) {
+                fprintf(stderr, "clEnqueueNDRangeKernel(single) failed\n");
                 return 1;
             }
+            k_exec = k_single;
+        } else {
+            k_exec = k_batch;
         }
 
         clFinish(q);
@@ -983,9 +1026,6 @@ int main(int argc, char **argv) {
         char en2_hex_submit[64];
         snprintf(en2_hex_submit, sizeof en2_hex_submit, "%0*x", S.extranonce2_size * 2, en2_val);
 
-        // Time rolling: Calculate submit_ntime with offset for Zergpool compliance
-        uint32_t submit_ntime = J.ntime + (g_batch_counter % 15);  // 0-14 seconds ahead
-
         for (cl_uint i = 0; i < loopN; i++) {
             uint8_t final_hash[32];
             sha3_256_once(&h_out[i * 32], 32, final_hash);
@@ -993,10 +1033,11 @@ int main(int argc, char **argv) {
 
             if (hash_meets_target_be(final_hash, g_share_target_be)) {
                 uint32_t nonce = (nonce_base - (used_batch ? BATCH : 1)) + i;
+                const char *jid = &job_id_per_nonce[i * 128];
                 printf("\nSHARE FOUND! job=%s nonce=%08x ntime=%08x (+%u)",
-                       J.job_id, nonce, submit_ntime, submit_ntime - J.ntime);
+                       jid, nonce, submit_ntime, submit_ntime - header_ntime);
                 fflush(stdout);
-                stratum_submit(&S, &J, en2_hex_submit, submit_ntime, nonce);
+                stratum_submit_with_jobid(&S, jid, en2_hex_submit, submit_ntime, nonce);
             }
         }
 
@@ -1034,7 +1075,7 @@ int main(int argc, char **argv) {
     free(ksrc);
     free(h_prehash);
     free(h_out);
+    free(job_id_per_nonce);
 
     return 0;
 }
-
