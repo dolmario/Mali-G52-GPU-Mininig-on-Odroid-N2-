@@ -1,4 +1,4 @@
-// src/main.c — vollständige Datei mit CPU-Argon2d-Check, Version-ENV und korrektem Prehash→GPU
+// src/main.c — RinHash GPU Miner (Hybrid: CPU init + GPU fill) — FULL FILE
 
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
@@ -36,18 +36,15 @@ static const int   PORT_DEFAULT = 7148;
 static const char *WAL  = "DTXoRQ7Zpw3FVRW2DWkLrM9Skj4Gp9SeSj";
 static const char *PASS = "c=DOGE,ID=n2plus";
 
-// RinHash-Parameter (GPU)
+// RinHash-Parameter (Spec)
 #define CHUNK_BLOCKS 256
 static const cl_uint T_COST    = 2;   // Argon2d-Pässe
-static const cl_uint M_COST_KB = 64;  // 64 KiB (aktueller GPU-Testwert)
+static const cl_uint M_COST_KB = 64;  // 64 KiB
+static const cl_uint ARGON_VER = 0x13;
 
-// Debug/CPU-Referenz (per ENV umschaltbar)
-static int      g_debug       = 0;
-static uint32_t g_cpu_t_cost  = 2;
-static uint32_t g_cpu_m_kib   = 64;
-static uint32_t g_cpu_lanes   = 1;
-static int      g_salt_mode   = 2; // 0=zero16, 1=prehash, 2="RinCoinSalt"(default hier), 3=no-salt
-static uint32_t g_argon_ver   = ARGON2_VERSION_13; // via ENV 10|13
+// Debug / Optionen (per Env)
+static int g_debug = 0;
+static int g_cpu_init = 1; // Hybrid-Mode standardmäßig AN
 
 // ============================ Utils ==============================
 static void blake3_hash32(const uint8_t *in, size_t len, uint8_t out[32]) {
@@ -84,7 +81,6 @@ static int hex2bin(const char *hex, uint8_t *out, size_t outlen) {
     }
     return 1;
 }
-
 static void hexdump(const char* name, const uint8_t* b, size_t n){
     printf("%s=", name);
     for (size_t i=0;i<n;i++) printf("%02x", b[i]);
@@ -140,12 +136,10 @@ static int set_nonblock(int s, int on) {
     if (on) flags |= O_NONBLOCK; else flags &= ~O_NONBLOCK;
     return fcntl(s, F_SETFL, flags);
 }
-
 static int is_numeric_ip(const char *s) {
     struct in6_addr a6; struct in_addr a4;
     return inet_pton(AF_INET, s, &a4) == 1 || inet_pton(AF_INET6, s, &a6) == 1;
 }
-
 static int sock_connect_verbose(const char *host, int port, int timeout_ms) {
     if (is_numeric_ip(host)) {
         int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -153,7 +147,7 @@ static int sock_connect_verbose(const char *host, int port, int timeout_ms) {
         struct sockaddr_in sa; memset(&sa,0,sizeof sa);
         sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);
         if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) { close(s); return -1; }
-        if (set_nonblock(s, 1) != 0) { perror("fcntl(O_NONBLOCK)"); close(s); return -1; }
+        if (set_nonblock(s, 1) != 0) { perror("fcntl"); close(s); return -1; }
         int rc = connect(s, (struct sockaddr*)&sa, sizeof sa);
         if (rc != 0 && errno != EINPROGRESS) { perror("connect"); close(s); return -1; }
         fd_set wfds; FD_ZERO(&wfds); FD_SET(s, &wfds);
@@ -165,7 +159,6 @@ static int sock_connect_verbose(const char *host, int port, int timeout_ms) {
         fprintf(stderr,"Connected to %s (numeric IP)\n", host);
         return s;
     }
-
     struct addrinfo hints = {0}, *res=NULL, *p=NULL;
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
@@ -207,8 +200,7 @@ static int sock_connect_verbose(const char *host, int port, int timeout_ms) {
         }
         int soerr=0; socklen_t slen=sizeof soerr;
         if (getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0 || soerr != 0) {
-            if (soerr) fprintf(stderr, "connect() error after select to %s (%s): %s\n", host, addrbuf[0]?addrbuf:"?", strerror(soerr));
-            else perror("getsockopt(SO_ERROR)");
+            fprintf(stderr, "connect() error after select to %s (%s): %s\n", host, addrbuf[0]?addrbuf:"?", (soerr?strerror(soerr):"getsockopt failed"));
             close(s); s = -1; continue;
         }
         fprintf(stderr, "Connected to %s (%s)\n", host, addrbuf[0]?addrbuf:"?");
@@ -305,7 +297,7 @@ static int stratum_connect_one(stratum_ctx_t *C,const char *host,int port,const 
     if (C->sock < 0) return 0;
 
     char sub[256];
-    snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/0.8\"]}\n");
+    snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/0.9\"]}\n");
     if(!send_line_verbose(C->sock,sub)) { fprintf(stderr,"Stratum send subscribe failed\n"); close(C->sock); return 0; }
 
     time_t t0=time(NULL); char line[16384];
@@ -378,7 +370,6 @@ static int stratum_parse_notify(const char *line, stratum_job_t *J){
     if(!get_next_quoted(p,rb,J->coinb1_hex,sizeof J->coinb1_hex)) return 0;
     if(!get_next_quoted(p,rb,J->coinb2_hex,sizeof J->coinb2_hex)) return 0;
 
-    // merkle array
     J->merkle_count = 0;
     const char *m_lb=strchr(p,'['), *m_rb=NULL;
     if (m_lb) { const char *scan=m_lb+1; for(;scan<rb;scan++){ if(*scan==']'){ m_rb=scan; break; }}}
@@ -392,7 +383,6 @@ static int stratum_parse_notify(const char *line, stratum_job_t *J){
         p = m_rb+1;
     }
 
-    // version, nbits, ntime (als hex-Strings)
     char vhex[16]={0}, nbhex[16]={0}, nth[16]={0};
     if(!get_next_quoted(p,rb,vhex,sizeof vhex)) return 0; sscanf(vhex,"%x",&J->version);
     if(!get_next_quoted(p,rb,nbhex,sizeof nbhex)) return 0; sscanf(nbhex,"%x",&J->nbits);
@@ -409,12 +399,10 @@ static int stratum_get_job(stratum_ctx_t *C, stratum_job_t *J){
         if (strstr(line,"\"mining.notify\"")) {
             if (stratum_parse_notify(line,J)) { got=1; break; }
         }
-        // set_difficulty & friends ignorieren
     }
     return got;
 }
 
-// Warte kurz auf Submit ACK (true / error)
 static void stratum_wait_submit_ack(int sock) {
     char line[4096];
     uint64_t start = 0;
@@ -438,7 +426,7 @@ static void stratum_wait_submit_ack(int sock) {
         }
         clock_gettime(CLOCK_MONOTONIC, &ts);
         uint64_t now = (uint64_t)ts.tv_sec*1000ull + ts.tv_nsec/1000000ull;
-        if (now - start > 1200) return; // max ~1.2 s warten
+        if (now - start > 1200) return;
         usleep(20000);
     }
 }
@@ -457,7 +445,6 @@ static int stratum_submit(stratum_ctx_t *C,const stratum_job_t *J,
     return ok;
 }
 
-// merkle (LE) aus coinbase-hash (BE) + branches (hex BE)
 static void build_merkle_root_le(const uint8_t cb_be[32], char merkle_hex[][65], int mcount, uint8_t out_le[32]) {
     uint8_t h_le[32]; for (int i=0;i<32;i++) h_le[i]=cb_be[31-i];
     for (int i=0;i<mcount;i++){
@@ -481,6 +468,144 @@ static void build_header_le(const stratum_job_t *J, const uint8_t prevhash_le[32
     memcpy(out80+68,&ntime,4);
     memcpy(out80+72,&nbits,4);
     memcpy(out80+76,&nonce,4);
+}
+
+// ======================= BLAKE2b (CPU, für H0/H′) =======================
+typedef unsigned long long u64;
+typedef unsigned int       u32;
+typedef unsigned char      u8;
+
+static inline u64 rotr64(u64 x, u32 n){ return (x >> n) | (x << (64 - n)); }
+
+static const u64 B2B_IV[8] = {
+  0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+  0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+  0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+  0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL
+};
+static const u32 B2B_SIGMA[12][16] = {
+ { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15},
+ {14,10, 4, 8, 9,15,13, 6, 1,12, 0, 2,11, 7, 5, 3},
+ {11, 8,12, 0, 5, 2,15,13,10,14, 3, 6, 7, 1, 9, 4},
+ { 7, 9, 3, 1,13,12,11,14, 2, 6, 5,10, 4, 0,15, 8},
+ { 9, 0, 5, 7, 2, 4,10,15,14, 1,11,12, 6, 8, 3,13},
+ { 2,12, 6,10, 4, 7,15,14, 1,13, 3, 9, 8, 5,11, 0},
+ {12, 5, 1,15,14,13, 4,10, 0, 7, 6, 3, 9, 2, 8,11},
+ {13,11, 7,14,12, 1, 3, 9, 5, 0,15, 4, 8, 6, 2,10},
+ { 6,15,14, 9,11, 3, 0, 8,12, 2,13, 7,10, 4, 1, 5},
+ {10, 2, 8, 4, 7, 6, 1, 5,15,11, 9,14, 3,12,13, 0},
+ { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15},
+ {14,10, 4, 8, 9,15,13, 6, 1,12, 0, 2,11, 7, 5, 3}
+};
+
+static inline void blake2b_init(u64 h[8], u32 outlen){
+    for (int i=0;i<8;i++) h[i]=B2B_IV[i];
+    h[0] ^= 0x01010000ULL ^ (u64)outlen;
+}
+
+#define GG(a,b,c,d,x,y) \
+    a = a + b + x; d = rotr64(d ^ a, 32); \
+    c = c + d;     b = rotr64(b ^ c, 24); \
+    a = a + b + y; d = rotr64(d ^ a, 16); \
+    c = c + d;     b = rotr64(b ^ c, 63);
+
+static inline void blake2b_compress(u64 h[8], const u8 block[128], u64 t0, u64 t1, u64 f0){
+    u64 m[16];
+    for (int i=0;i<16;i++){
+        int o=i*8;
+        m[i] = ((u64)block[o]) | ((u64)block[o+1]<<8) | ((u64)block[o+2]<<16) | ((u64)block[o+3]<<24) |
+               ((u64)block[o+4]<<32)| ((u64)block[o+5]<<40)| ((u64)block[o+6]<<48)| ((u64)block[o+7]<<56);
+    }
+    u64 v[16];
+    for (int i=0;i<8;i++) v[i]=h[i];
+    for (int i=0;i<8;i++) v[i+8]=B2B_IV[i];
+    v[12] ^= t0; v[13] ^= t1;
+    v[14] ^= f0;
+
+    for (int r=0;r<12;r++){
+        const u32* s = &B2B_SIGMA[r][0];
+        GG(v[0],v[4],v[8], v[12], m[s[0]], m[s[1]]);
+        GG(v[1],v[5],v[9], v[13], m[s[2]], m[s[3]]);
+        GG(v[2],v[6],v[10],v[14], m[s[4]], m[s[5]]);
+        GG(v[3],v[7],v[11],v[15], m[s[6]], m[s[7]]);
+        GG(v[0],v[5],v[10],v[15], m[s[8]], m[s[9]]);
+        GG(v[1],v[6],v[11],v[12], m[s[10]],m[s[11]]);
+        GG(v[2],v[7],v[8], v[13], m[s[12]],m[s[13]]);
+        GG(v[3],v[4],v[9], v[14], m[s[14]],m[s[15]]);
+    }
+    for (int i=0;i<8;i++) h[i] ^= v[i] ^ v[i+8];
+}
+#undef GG
+
+// Hash für <=128B Input, out<=64
+static inline void blake2b_hash(u8* out, u32 outlen, const u8* in, u32 inlen){
+    u64 h[8]; blake2b_init(h, outlen);
+    u8 block[128]={0};
+    for (u32 i=0;i<inlen && i<128;i++) block[i]=in[i];
+    u64 t0 = (u64)inlen, t1 = 0, f0 = ~((u64)0);
+    blake2b_compress(h, block, t0, t1, f0);
+    for (int i=0;i<8;i++){
+        u64 v=h[i];
+        int o=i*8;
+        out[o+0]=(u8)(v); out[o+1]=(u8)(v>>8); out[o+2]=(u8)(v>>16); out[o+3]=(u8)(v>>24);
+        out[o+4]=(u8)(v>>32); out[o+5]=(u8)(v>>40); out[o+6]=(u8)(v>>48); out[o+7]=(u8)(v>>56);
+    }
+    // outlen <=64, out ist bereits befüllt, ggf. abgeschnitten
+}
+
+// H' (blake2b_long)
+static inline void st32p(u8* p, u32 v){ p[0]=(u8)v; p[1]=(u8)(v>>8); p[2]=(u8)(v>>16); p[3]=(u8)(v>>24); }
+
+static inline void blake2b_long(u8* out, u32 outlen, const u8* in, u32 inlen){
+    u8 tmp[64];
+    u8 buf[4 + 256]; // 4B τ + in (klein bei uns)
+    st32p(buf, outlen);
+    for (u32 i=0;i<inlen;i++) buf[4+i]=in[i];
+
+    if (outlen <= 64){
+        blake2b_hash(out, outlen, buf, 4+inlen);
+        return;
+    }
+    blake2b_hash(tmp, 64, buf, 4+inlen);
+    u32 written = 0, remain = outlen;
+    for (;;){
+        u32 take = (remain > 32) ? 32 : remain;
+        for (u32 i=0;i<take;i++) out[written+i]=tmp[i];
+        written += take; remain -= take;
+        if (!remain) break;
+        blake2b_hash(tmp, 64, tmp, 64);
+    }
+}
+
+// Argon2d H0 + erste zwei Blöcke (p=1, t=2, m=64 KiB, ver=0x13, salt="RinCoinSalt")
+static void argon2d_cpu_first_blocks(const uint8_t pwd32[32], uint32_t blocks_per_lane,
+                                     uint8_t B0[1024], uint8_t B1[1024]){
+    const char *salt = "RinCoinSalt";
+    const u32 saltlen = 11;
+    u8 param[4*10 + 32 + 11]; // lanes, tau, m, t, version, type, |P|, P, |S|, S, |K|, |X|
+    u32 off=0;
+    st32p(param+off, 1);            off+=4;              // lanes
+    st32p(param+off, 32);           off+=4;              // tau
+    st32p(param+off, blocks_per_lane); off+=4;           // m (KB == blocks)
+    st32p(param+off, T_COST);       off+=4;              // t
+    st32p(param+off, ARGON_VER);    off+=4;              // version
+    st32p(param+off, 0);            off+=4;              // type (0 = d)
+    st32p(param+off, 32);           off+=4;              // |P|
+    memcpy(param+off, pwd32, 32);   off+=32;             // P
+    st32p(param+off, saltlen);      off+=4;              // |S|
+    memcpy(param+off, salt, saltlen); off+=saltlen;      // S
+    st32p(param+off, 0);            off+=4;              // |K|=0
+    st32p(param+off, 0);            off+=4;              // |X|=0
+
+    u8 H0[64];
+    blake2b_hash(H0, 64, param, off);
+
+    u8 inX[64+4+4];
+    memcpy(inX, H0, 64);
+    st32p(inX+64, 0); st32p(inX+68, 0); // idx=0, lane=0
+    blake2b_long(B0, 1024, inX, 72);
+    st32p(inX+64, 1); st32p(inX+68, 0); // idx=1, lane=0
+    blake2b_long(B1, 1024, inX, 72);
 }
 
 // ============================ OpenCL =============================
@@ -507,7 +632,6 @@ static char* load_kernel_source(const char *filename) {
     exit(1);
 }
 
-// Monotonic ms
 static inline uint64_t mono_ms(void){
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec*1000ull + (uint64_t)ts.tv_nsec/1000000ull;
@@ -523,311 +647,236 @@ static void check_arg(const char* name, cl_int e, int idx){
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int sig){ (void)sig; g_stop = 1; }
 
-// ======================= CPU Argon2d Oracle ======================
-static uint32_t rin_argon2_version_from_env(void){
-    const char* e = getenv("RIN_ARGON2_VER"); // "10" oder "13"
-    if (!e || !e[0]) return ARGON2_VERSION_13;
-    unsigned v = (unsigned)strtoul(e,NULL,10);
-    return (v==10) ? ARGON2_VERSION_10 : ARGON2_VERSION_13;
-}
-
-static int argon2d_cpu_check(const uint8_t* pwd, uint32_t pwdlen,
-                              const uint8_t* salt, uint32_t saltlen,
-                              uint8_t out[32]) {
-    argon2_context context = {
-        .out = out,
-        .outlen = 32,
-        .pwd = (uint8_t*)pwd,
-        .pwdlen = pwdlen,
-        .salt = (uint8_t*)salt,
-        .saltlen = saltlen,
-        .secret = NULL,
-        .secretlen = 0,
-        .ad = NULL,
-        .adlen = 0,
-        .t_cost = g_cpu_t_cost,
-        .m_cost = g_cpu_m_kib,
-        .lanes = g_cpu_lanes,
-        .threads = g_cpu_lanes,
-        .version = g_argon_ver,
-        .allocate_cbk = NULL,
-        .free_cbk = NULL,
-        .flags = ARGON2_DEFAULT_FLAGS
-    };
-    int result = argon2_ctx(&context, Argon2_d);
-    return result == ARGON2_OK;
-}
-
-static int cpu_argon2d_reference(const uint8_t prehash[32], uint8_t cpu_out[32]) {
-    uint8_t salt[64];
-    uint32_t saltlen = 0;
-
-    switch (g_salt_mode) {
-        case 0: memset(salt, 0, 16);          saltlen = 16; break;             // zero16
-        case 1: memcpy(salt, prehash, 32);    saltlen = 32; break;             // prehash
-        case 2: strcpy((char*)salt, "RinCoinSalt"); saltlen = 11; break;       // literal
-        case 3: saltlen = 0; break;                                           // no-salt
-        default: memcpy(salt, prehash, 32); saltlen = 32; break;
-    }
-    return argon2d_cpu_check(prehash, 32, salt, saltlen, cpu_out);
-}
-
 // ============================== MAIN ============================
 int main(int argc, char **argv) {
-    signal(SIGINT, on_sigint);
+   signal(SIGINT, on_sigint);
 
-    // ENV Variablen lesen
-    if (getenv("RIN_DEBUG"))      g_debug      = atoi(getenv("RIN_DEBUG"));
-    if (getenv("RIN_T_COST"))     g_cpu_t_cost = (uint32_t)atoi(getenv("RIN_T_COST"));
-    if (getenv("RIN_M_KiB"))      g_cpu_m_kib  = (uint32_t)atoi(getenv("RIN_M_KiB"));
-    if (getenv("RIN_LANES"))      g_cpu_lanes  = (uint32_t)atoi(getenv("RIN_LANES"));
-    if (getenv("RIN_SALT_MODE"))  g_salt_mode  = atoi(getenv("RIN_SALT_MODE"));
-    g_argon_ver = rin_argon2_version_from_env();
+   // ENV
+   if (getenv("RIN_DEBUG"))    g_debug = atoi(getenv("RIN_DEBUG"));
+   if (getenv("RIN_CPU_INIT")) g_cpu_init = atoi(getenv("RIN_CPU_INIT"));
 
-    cl_uint m_cost_kb = M_COST_KB;
-    if (argc > 1) printf("WARNING: Memory arg ignored. Using spec-compliant 64 KiB\n");
-    printf("Using %u KiB memory (RinHash spec)\n", (unsigned)m_cost_kb);
+   cl_uint m_cost_kb = M_COST_KB;
+   if (argc > 1) printf("WARNING: Memory arg ignored. Using spec-compliant 64 KiB\n");
+   printf("Using %u KiB memory (RinHash spec)\n", (unsigned)m_cost_kb);
+   printf("CPU Argon2d params: t_cost=%u, m_cost=%u KiB, lanes=1, salt_mode=RinCoinSalt, ver=0x%02x\n",
+          T_COST, m_cost_kb, ARGON_VER);
 
-    if (g_debug) {
-        const char* salt_names[] = {"zero16","prehash","RinCoinSalt","no-salt"};
-        printf("CPU Argon2d params: t_cost=%u, m_cost=%u KiB, lanes=%u, salt_mode=%s, ver=%s\n",
-               g_cpu_t_cost, g_cpu_m_kib, g_cpu_lanes,
-               (g_salt_mode>=0 && g_salt_mode<=3)?salt_names[g_salt_mode]:"?",
-               (g_argon_ver==ARGON2_VERSION_10)?"0x10":"0x13");
-    }
+   // OpenCL Setup
+   cl_int err; cl_platform_id plat; cl_device_id dev;
+   clGetPlatformIDs(1,&plat,NULL);
+   err = clGetDeviceIDs(plat,CL_DEVICE_TYPE_GPU,1,&dev,NULL);
+   if (err!=CL_SUCCESS){ fprintf(stderr,"No GPU device found\n"); return 1; }
 
-    // OpenCL Setup
-    cl_int err; cl_platform_id plat; cl_device_id dev;
-    clGetPlatformIDs(1,&plat,NULL);
-    err = clGetDeviceIDs(plat,CL_DEVICE_TYPE_GPU,1,&dev,NULL);
-    if (err!=CL_SUCCESS){ fprintf(stderr,"No GPU device found\n"); return 1; }
+   char devname[256]; clGetDeviceInfo(dev,CL_DEVICE_NAME,sizeof devname,devname,NULL);
+   printf("Device: %s\n", devname);
 
-    char devname[256]; clGetDeviceInfo(dev,CL_DEVICE_NAME,sizeof devname,devname,NULL);
-    printf("Device: %s\n", devname);
+   cl_context ctx = clCreateContext(NULL,1,&dev,NULL,NULL,&err);
+   cl_command_queue q = clCreateCommandQueue(ctx,dev,0,&err);
+   if (err!=CL_SUCCESS){ fprintf(stderr,"clCreateCommandQueue: %d\n",err); return 1; }
 
-    cl_context ctx = clCreateContext(NULL,1,&dev,NULL,NULL,&err);
-    cl_command_queue q = clCreateCommandQueue(ctx,dev,0,&err);
-    if (err!=CL_SUCCESS){ fprintf(stderr,"clCreateCommandQueue: %d\n",err); return 1; }
+   char *ksrc = load_kernel_source("rinhash_argon2d.cl");
+   cl_program prog = clCreateProgramWithSource(ctx,1,(const char**)&ksrc,NULL,&err);
+   err = clBuildProgram(prog,1,&dev,"-cl-std=CL1.2",NULL,NULL);
+   if (err!=CL_SUCCESS){
+       size_t L; clGetProgramBuildInfo(prog,dev,CL_PROGRAM_BUILD_LOG,0,NULL,&L);
+       char *log=(char*)malloc(L+1); clGetProgramBuildInfo(prog,dev,CL_PROGRAM_BUILD_LOG,L,log,NULL);
+       log[L]=0; fprintf(stderr,"Build failed:\n%s\n",log); free(log); return 1;
+   }
+   cl_kernel krn = clCreateKernel(prog,"argon2d_core",&err);
+   if (err!=CL_SUCCESS){ fprintf(stderr,"clCreateKernel failed: %d\n", err); return 1; }
 
-    char *ksrc = load_kernel_source("rinhash_argon2d.cl");
-    cl_program prog = clCreateProgramWithSource(ctx,1,(const char**)&ksrc,NULL,&err);
-    err = clBuildProgram(prog,1,&dev,"-cl-std=CL1.2",NULL,NULL);
-    if (err!=CL_SUCCESS){
-        size_t L; clGetProgramBuildInfo(prog,dev,CL_PROGRAM_BUILD_LOG,0,NULL,&L);
-        char *log=(char*)malloc(L+1); clGetProgramBuildInfo(prog,dev,CL_PROGRAM_BUILD_LOG,L,log,NULL);
-        log[L]=0; fprintf(stderr,"Build failed:\n%s\n",log); free(log); return 1;
-    }
-    cl_kernel krn = clCreateKernel(prog,"argon2d_core",&err);
-    if (err!=CL_SUCCESS){ fprintf(stderr,"clCreateKernel failed: %d\n", err); return 1; }
+   // Speicher: lane memory + prehash32 + out32
+   size_t m_bytes = (size_t)m_cost_kb * 1024;
+   cl_mem d_mem   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,m_bytes,NULL,&err);
+   cl_mem d_phash = clCreateBuffer(ctx,CL_MEM_READ_ONLY, 32,NULL,&err);
+   cl_mem d_out   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,32,NULL,&err);
 
-    // Speicher: 64 KiB
-    size_t m_bytes = (size_t)m_cost_kb * 1024;
-    cl_mem d_mem   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,m_bytes,NULL,&err);
-    cl_mem d_phash = clCreateBuffer(ctx,CL_MEM_READ_ONLY, 32,NULL,&err);  // <-- FIX: 32B prehash
-    cl_mem d_out   = clCreateBuffer(ctx,CL_MEM_READ_WRITE,32,NULL,&err);
+   // ===== Stratum =====
+   int         PORT = getenv("POOL_PORT") ? atoi(getenv("POOL_PORT")) : PORT_DEFAULT;
+   stratum_ctx_t S;
+   if(!stratum_connect_any(&S, POOL_CANDIDATES, PORT, WAL, PASS)){
+       fprintf(stderr,"Stratum connect failed (all hosts)\n");
+       return 1;
+   }
 
-    // ===== Stratum =====
-    int         PORT = getenv("POOL_PORT") ? atoi(getenv("POOL_PORT")) : PORT_DEFAULT;
-    stratum_ctx_t S;
-    if(!stratum_connect_any(&S, POOL_CANDIDATES, PORT, WAL, PASS)){
-        fprintf(stderr,"Stratum connect failed (all hosts)\n");
-        return 1;
-    }
+   uint8_t prevhash_le[32], merkleroot_le[32], target_be[32];
+   stratum_job_t J={0}, Jnew={0}; int have_job=0;
 
-    uint8_t prevhash_le[32], merkleroot_le[32], target_be[32];
-    stratum_job_t J={0}, Jnew={0}; int have_job=0;
+   uint64_t hashes_window = 0;
+   uint64_t t_poll  = mono_ms();
+   uint64_t t_print = mono_ms();
 
-    uint64_t hashes_window = 0;
-    uint64_t t_print = mono_ms();
-    uint64_t t_poll  = mono_ms();
+   while (!g_stop) {
+       // Polling
+       if (mono_ms() - t_poll >= 100) {
+           while (stratum_get_job(&S, &Jnew)) {
+               if (!have_job || strcmp(Jnew.job_id, J.job_id) != 0 || Jnew.clean) {
+                   J = Jnew; have_job = 1;
+                   uint8_t prev_be[32]; hex2bin(J.prevhash_hex, prev_be, 32);
+                   for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be[31 - i];
+                   target_from_nbits(J.nbits, target_be);
+                   printf("Job %s ready. nbits=%08x ntime=%08x\n", J.job_id, J.nbits, J.ntime);
+                   fflush(stdout);
+               }
+           }
+           t_poll = mono_ms();
+       }
+       if (!have_job) { usleep(10000); continue; }
 
-    while (!g_stop) {
-        // Polling
-        if (mono_ms() - t_poll >= 100) {
-            while (stratum_get_job(&S, &Jnew)) {
-                if (!have_job || strcmp(Jnew.job_id, J.job_id) != 0 || Jnew.clean) {
-                    J = Jnew; have_job = 1;
-                    uint8_t prev_be[32]; hex2bin(J.prevhash_hex, prev_be, 32);
-                    for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be[31 - i];
-                    target_from_nbits(J.nbits, target_be);
-                    printf("Job %s ready. nbits=%08x ntime=%08x\n", J.job_id, J.nbits, J.ntime);
-                    fflush(stdout);
-                }
-            }
-            t_poll = mono_ms();
-        }
-        if (!have_job) { usleep(10000); continue; }
+       // Coinbase, Merkle
+       uint8_t coinb1[4096], coinb2[4096];
+       size_t cb1 = strlen(J.coinb1_hex) / 2, cb2 = strlen(J.coinb2_hex) / 2;
+       hex2bin(J.coinb1_hex, coinb1, cb1);
+       hex2bin(J.coinb2_hex, coinb2, cb2);
 
-        // Coinbase, Merkle
-        uint8_t coinb1[4096], coinb2[4096];
-        size_t cb1 = strlen(J.coinb1_hex) / 2, cb2 = strlen(J.coinb2_hex) / 2;
-        hex2bin(J.coinb1_hex, coinb1, cb1);
-        hex2bin(J.coinb2_hex, coinb2, cb2);
+       uint8_t en1[64]; size_t en1b = strlen(S.extranonce1) / 2; if (en1b > 64) en1b = 64;
+       hex2bin(S.extranonce1, en1, en1b);
+       static cl_uint en2_counter = 1;
+       char en2_hex[64];
+       snprintf(en2_hex, sizeof en2_hex, "%0*x", S.extranonce2_size * 2, en2_counter++);
+       uint8_t en2[64]; hex2bin(en2_hex, en2, S.extranonce2_size);
 
-        uint8_t en1[64]; size_t en1b = strlen(S.extranonce1) / 2; if (en1b > 64) en1b = 64;
-        hex2bin(S.extranonce1, en1, en1b);
-        static cl_uint en2_counter = 1;
-        char en2_hex[64];
-        snprintf(en2_hex, sizeof en2_hex, "%0*x", S.extranonce2_size * 2, en2_counter++);
-        uint8_t en2[64]; hex2bin(en2_hex, en2, S.extranonce2_size);
+       uint8_t coinbase[8192]; size_t off = 0;
+       memcpy(coinbase + off, coinb1, cb1); off += cb1;
+       memcpy(coinbase + off, en1, en1b); off += en1b;
+       memcpy(coinbase + off, en2, S.extranonce2_size); off += S.extranonce2_size;
+       memcpy(coinbase + off, coinb2, cb2); off += cb2;
 
-        uint8_t coinbase[8192]; size_t off = 0;
-        memcpy(coinbase + off, coinb1, cb1); off += cb1;
-        memcpy(coinbase + off, en1, en1b); off += en1b;
-        memcpy(coinbase + off, en2, S.extranonce2_size); off += S.extranonce2_size;
-        memcpy(coinbase + off, coinb2, cb2); off += cb2;
+       uint8_t cbh_be[32]; double_sha256(coinbase, off, cbh_be);
+       build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
 
-        uint8_t cbh_be[32]; double_sha256(coinbase, off, cbh_be);
-        build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
+       // === Nonce-Schleife ===
+       const cl_uint NONCES_PER_ITER = 20000;
 
-        // === Nonce-Schleife ===
-        const cl_uint NONCES_PER_ITER = 20000;
-        static int did_debug_for_job = 0;
+       for (cl_uint nonce = 0; nonce < NONCES_PER_ITER && !g_stop; nonce++) {
+           uint8_t header[80];
+           build_header_le(&J, prevhash_le, merkleroot_le, J.ntime, J.nbits, nonce, header);
 
-        for (cl_uint nonce = 0; nonce < NONCES_PER_ITER && !g_stop; nonce++) {
-            // Header (LE)
-            uint8_t header[80];
-            build_header_le(&J, prevhash_le, merkleroot_le, J.ntime, J.nbits, nonce, header);
+           uint8_t prehash32[32]; blake3_hash32(header, 80, prehash32);
 
-            // BLAKE3 (pwd/prehash)
-            uint8_t prehash[32]; blake3_hash32(header, 80, prehash);
+           // d_out nullen
+           static const uint8_t zero32[32] = {0};
+           clEnqueueWriteBuffer(q, d_out, CL_FALSE, 0, 32, zero32, 0, NULL, NULL);
 
-            // d_out nullen
-            static const uint8_t zero32[32] = {0};
-            clEnqueueWriteBuffer(q, d_out, CL_FALSE, 0, 32, zero32, 0, NULL, NULL);
+           // prehash32 → GPU (nur relevant, falls do_init=1)
+           cl_event write_ev;
+           clEnqueueWriteBuffer(q, d_phash, CL_FALSE, 0, 32, prehash32, 0, NULL, &write_ev);
+           clWaitForEvents(1, &write_ev);
+           clReleaseEvent(write_ev);
 
-            // Prehash (32B) in GPU schreiben  —— WICHTIG
-            cl_event write_ev;
-            clEnqueueWriteBuffer(q, d_phash, CL_FALSE, 0, 32, prehash, 0, NULL, &write_ev);
-            clWaitForEvents(1, &write_ev);
-            clReleaseEvent(write_ev);
+           // CPU init (B0,B1) falls aktiviert
+           cl_uint do_init = 1;
+           if (g_cpu_init) {
+               uint8_t B0[1024], B1[1024];
+               argon2d_cpu_first_blocks(prehash32, m_cost_kb, B0, B1);
+               clEnqueueWriteBuffer(q, d_mem, CL_TRUE, 0,     1024, B0, 0, NULL, NULL);
+               clEnqueueWriteBuffer(q, d_mem, CL_TRUE, 1024,  1024, B1, 0, NULL, NULL);
+               do_init = 0;
+               if (g_debug && nonce==0){
+                   printf("[DEBUG] CPU-init wrote B0/B1 for job %s\n", J.job_id);
+               }
+           }
 
-            // ===== Kernel-Args korrekt & jedes Mal setzen =====
-            err = clSetKernelArg(krn, 0, sizeof(cl_mem), &d_phash);         check_arg("prehash32", err, 0);
-            err = clSetKernelArg(krn, 1, sizeof(cl_mem), &d_mem);           check_arg("mem", err, 1);
-            err = clSetKernelArg(krn, 2, sizeof(cl_uint), &m_cost_kb);      check_arg("blocks_per_lane", err, 2);
-            err = clSetKernelArg(krn, 7, sizeof(cl_mem), &d_out);           check_arg("out32", err, 7);
+           // ===== Kernel-Args =====
+           err = clSetKernelArg(krn, 0, sizeof(cl_mem), &d_phash);         check_arg("prehash32", err, 0);
+           err = clSetKernelArg(krn, 1, sizeof(cl_mem), &d_mem);           check_arg("mem", err, 1);
+           err = clSetKernelArg(krn, 2, sizeof(cl_uint), &m_cost_kb);      check_arg("blocks_per_lane", err, 2);
+           err = clSetKernelArg(krn, 7, sizeof(cl_mem), &d_out);           check_arg("out32", err, 7);
+           err = clSetKernelArg(krn, 8, sizeof(cl_uint), &do_init);        check_arg("do_init", err, 8);
 
-            // t=2, 4 Slices, CHUNK_BLOCKS
-            for (cl_uint pass = 0; pass < T_COST; pass++) {
-                for (cl_uint slice = 0; slice < 4; slice++) {
-                    const cl_uint slice_begin = slice * (m_cost_kb / 4);
-                    const cl_uint slice_end   = (slice + 1) * (m_cost_kb / 4);
-                    for (cl_uint start = slice_begin; start < slice_end; start += CHUNK_BLOCKS) {
-                        cl_uint end = start + CHUNK_BLOCKS; if (end > slice_end) end = slice_end;
-                        const cl_uint do_init = (pass == 0 && slice == 0 && start == 0) ? 1U : 0U;
+           // t=2, 4 Slices, CHUNK_BLOCKS
+           for (cl_uint pass = 0; pass < T_COST; pass++) {
+               for (cl_uint slice = 0; slice < 4; slice++) {
+                   const cl_uint slice_begin = slice * (m_cost_kb / 4);
+                   const cl_uint slice_end   = (slice + 1) * (m_cost_kb / 4);
+                   for (cl_uint start = slice_begin; start < slice_end; start += CHUNK_BLOCKS) {
+                       cl_uint end = start + CHUNK_BLOCKS; if (end > slice_end) end = slice_end;
 
-                        err = clSetKernelArg(krn, 3, sizeof(cl_uint), &pass);   check_arg("pass_index", err, 3);
-                        err = clSetKernelArg(krn, 4, sizeof(cl_uint), &slice);  check_arg("slice_index", err, 4);
-                        err = clSetKernelArg(krn, 5, sizeof(cl_uint), &start);  check_arg("start_block", err, 5);
-                        err = clSetKernelArg(krn, 6, sizeof(cl_uint), &end);    check_arg("end_block", err, 6);
-                        err = clSetKernelArg(krn, 8, sizeof(cl_uint), &do_init);check_arg("do_init", err, 8);
+                       err = clSetKernelArg(krn, 3, sizeof(cl_uint), &pass);   check_arg("pass_index", err, 3);
+                       err = clSetKernelArg(krn, 4, sizeof(cl_uint), &slice);  check_arg("slice_index", err, 4);
+                       err = clSetKernelArg(krn, 5, sizeof(cl_uint), &start);  check_arg("start_block", err, 5);
+                       err = clSetKernelArg(krn, 6, sizeof(cl_uint), &end);    check_arg("end_block", err, 6);
 
-                        size_t G = 1;
-                        err = clEnqueueNDRangeKernel(q, krn, 1, NULL, &G, NULL, 0, NULL, NULL);
-                        if (err != CL_SUCCESS) {
-                            fprintf(stderr, "clEnqueueNDRangeKernel failed: %d\n", err);
-                            exit(1);
-                        }
-                        clFlush(q);
-                    }
-                }
-            }
-            clFinish(q);
+                       size_t G = 1;
+                       err = clEnqueueNDRangeKernel(q, krn, 1, NULL, &G, NULL, 0, NULL, NULL);
+                       if (err != CL_SUCCESS) {
+                           fprintf(stderr, "clEnqueueNDRangeKernel failed: %d\n", err);
+                           exit(1);
+                       }
+                       clFlush(q);
+                   }
+               }
+           }
+           clFinish(q);
 
-            // GPU-Argon2d-Output (roh, 32B)
-            uint8_t argon_gpu[32]; clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32, argon_gpu, 0, NULL, NULL);
+           // GPU-Argon2d-Tag (32B), dann SHA3-256
+           uint8_t argon_gpu[32]; clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32, argon_gpu, 0, NULL, NULL);
+           if (g_debug && nonce==0){
+               hexdump("prehash", prehash32, 32);
+               hexdump("gpu_argon2", argon_gpu, 32);
+           }
 
-            // === Debug: CPU-Referenz vergleichen (nur 1x pro Job bei erstem Nonce)
-            if (g_debug && !did_debug_for_job && nonce == 0) {
-                const char* salt_names[] = {"zero16", "prehash", "RinCoinSalt", "no-salt"};
-                uint8_t cpu_out[32];
-                printf("\n[DEBUG] GPU vs CPU Argon2d check (Job: %s, nonce: %u)\n", J.job_id, nonce);
-                hexdump("prehash", prehash, 32);
-                hexdump("gpu_argon2", argon_gpu, 32);
+           uint8_t final_hash[32]; sha3_256(argon_gpu, 32, final_hash);
 
-                if (cpu_argon2d_reference(prehash, cpu_out)) {
-                    hexdump("cpu_argon2", cpu_out, 32);
-                    printf("[DEBUG] CPU params: t=%u, m=%u KiB, lanes=%u, salt=%s, ver=%s\n",
-                           g_cpu_t_cost, g_cpu_m_kib, g_cpu_lanes,
-                           (g_salt_mode >= 0 && g_salt_mode <= 3) ? salt_names[g_salt_mode] : "unknown",
-                           (g_argon_ver==ARGON2_VERSION_10)?"0x10":"0x13");
+           // Target (BE) Vergleich (final_hash ist BE)
+           int ok = 1;
+           for (int i = 0; i < 32; i++) {
+               if (final_hash[i] < target_be[i]) { ok = 1; break; }
+               if (final_hash[i] > target_be[i]) { ok = 0; break; }
+           }
+           if (ok) {
+               printf("FOUND share  ntime=%08x nonce=%08x", J.ntime, nonce);
+               if (stratum_submit(&S, &J, en2_hex, J.ntime, nonce)) {
+                   // ACK-Ausgabe im Submit
+               } else {
+                   printf(" -> Submit failed\n");
+               }
+           }
 
-                    if (memcmp(cpu_out, argon_gpu, 32) == 0) {
-                        printf("[DEBUG] CPU == GPU ✅\n");
-                    } else {
-                        printf("[DEBUG] CPU != GPU ❌\n");
-                    }
-                } else {
-                    printf("[DEBUG] CPU Argon2d failed\n");
-                }
-                printf("\n");
-                did_debug_for_job = 1;
-            }
+           // Stats
+           hashes_window++;
+           uint64_t now = mono_ms();
+           static uint64_t t_print_local = 0;
+           if (!t_print_local) t_print_local = now;
+           if (now - t_print_local >= 5000) {
+               double secs = (now - t_print_local) / 1000.0;
+               double rate = hashes_window / secs;
+               printf("Hashrate: %.1f H/s | Job: %s\r", rate, J.job_id[0]?J.job_id:"-");
+               fflush(stdout);
+               t_print_local = now;
+               hashes_window = 0;
+           }
 
-            // Final SHA3-256 über Argon-Output
-            uint8_t final_hash[32]; sha3_256(argon_gpu, 32, final_hash);
+           // sanftes Stratum-Polling
+           if ((nonce % 1000) == 0 && mono_ms() - t_poll >= 100) {
+               stratum_job_t Jtmp;
+               while (stratum_get_job(&S, &Jtmp)) {
+                   if (strcmp(Jtmp.job_id, J.job_id) != 0 || Jtmp.clean) {
+                       J = Jtmp;
+                       uint8_t prev_be2[32]; hex2bin(J.prevhash_hex, prev_be2, 32);
+                       for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be2[31 - i];
+                       target_from_nbits(J.nbits, target_be);
+                       printf("\nSwitch to job %s\n", J.job_id);
+                       fflush(stdout);
+                       break;
+                   }
+               }
+               t_poll = mono_ms();
+           }
+       } // nonces
+       usleep(5000);
+   }
 
-            // Target (BE) Vergleich
-            int ok = 1;
-            for (int i = 0; i < 32; i++) {
-                if (final_hash[i] < target_be[i]) { ok = 1; break; }
-                if (final_hash[i] > target_be[i]) { ok = 0; break; }
-            }
-            if (ok) {
-                printf("FOUND share  ntime=%08x nonce=%08x", J.ntime, nonce);
-                if (stratum_submit(&S, &J, en2_hex, J.ntime, nonce)) {
-                    // ACK-Ausgabe passiert im Submit
-                } else {
-                    printf(" -> Submit failed\n");
-                }
-            }
-
-            // Stats
-            hashes_window++;
-            uint64_t now = mono_ms();
-            static uint64_t t_print_local = 0;
-            if (!t_print_local) t_print_local = now;
-            if (now - t_print_local >= 5000) {
-                double secs = (now - t_print_local) / 1000.0;
-                double rate = hashes_window / secs;
-                printf("Hashrate: %.1f H/s | Job: %s\r", rate, J.job_id[0]?J.job_id:"-");
-                fflush(stdout);
-                t_print_local = now;
-                hashes_window = 0;
-            }
-
-            // sanftes Stratum-Polling
-            if ((nonce % 1000) == 0 && mono_ms() - t_poll >= 100) {
-                stratum_job_t Jtmp;
-                while (stratum_get_job(&S, &Jtmp)) {
-                    if (strcmp(Jtmp.job_id, J.job_id) != 0 || Jtmp.clean) {
-                        J = Jtmp;
-                        uint8_t prev_be2[32]; hex2bin(J.prevhash_hex, prev_be2, 32);
-                        for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be2[31 - i];
-                        target_from_nbits(J.nbits, target_be);
-                        printf("\nSwitch to job %s\n", J.job_id);
-                        fflush(stdout);
-                        did_debug_for_job = 0; // bei neuem Job wieder debuggen erlauben
-                        break;
-                    }
-                }
-                t_poll = mono_ms();
-            }
-        } // nonces
-        usleep(5000);
-    }
-
-    clReleaseKernel(krn);
-    clReleaseProgram(prog);
-    clReleaseMemObject(d_mem);
-    clReleaseMemObject(d_phash);
-    clReleaseMemObject(d_out);
-    clReleaseCommandQueue(q);
-    clReleaseContext(ctx);
-    close(S.sock);
-    free(ksrc);
-
-    return 0;
+   clReleaseKernel(krn);
+   clReleaseProgram(prog);
+   clReleaseMemObject(d_mem);
+   clReleaseMemObject(d_phash);
+   clReleaseMemObject(d_out);
+   clReleaseCommandQueue(q);
+   clReleaseContext(ctx);
+   close(S.sock);
+   free(ksrc);
+   return 0;
 }
+
 
