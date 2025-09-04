@@ -1,14 +1,26 @@
-// src/main.c – RinHash GPU Miner (Batch-GPU Mode) – FULL FILE
+// src/main.c — RinHash Batch-GPU Miner (Odroid N2+ / Mali-G52 Panfrost)
+// Pipeline: BLAKE3(80B header LE) -> Argon2d (GPU) -> SHA3-256 (CPU) -> compare vs share target (BE) -> submit
+// Stratum: Zergpool RinHash (subscribe/authorize/notify/set_difficulty/submit)
+// - Kernel file rinhash_argon2d.cl remains unchanged.
+// - Batch kernel preferred; single-kernel fallback retained.
+// - Robust arg setup for batch kernel to avoid CL_INVALID_KERNEL_ARGS (-52).
+// - Handles d=/sd= in POOL_PASS, optional RIN_FORCE_DIFF; quiet logs; RIN_DEBUG=1 shows first-batch debug.
 
 #define CL_TARGET_OPENCL_VERSION 120
+#ifndef CL_KERNEL_NUM_ARGS
+#define CL_KERNEL_NUM_ARGS 0x1195
+#endif
 #include <CL/cl.h>
+
 #include <openssl/evp.h>
 #include <openssl/sha.h>
+
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+
 #include <stdint.h>
 #include <pthread.h>
 #include <sys/select.h>
@@ -20,11 +32,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <math.h>
 
 #include "blake3.h"
-#include "argon2.h"
 
-// ============================ Konfig =============================
+// ============================ Defaults =============================
 static const char *POOL_CANDIDATES[] = {
     "rinhash.eu.mine.zergpool.com",
     "rinhash.mine.zergpool.com",
@@ -33,23 +45,30 @@ static const char *POOL_CANDIDATES[] = {
     NULL
 };
 static const int   PORT_DEFAULT = 7148;
-static const char *WAL  = "DTXoRQ7Zpw3FVRW2DWkLrM9Skj4Gp9SeSj";
-static const char *PASS = "c=DOGE,ID=n2plus";
 
-// RinHash-Parameter (Spec)
-#define CHUNK_BLOCKS 256
-static const cl_uint T_COST    = 2;   // Argon2d-Pässe
-static const cl_uint M_COST_KB = 64;  // 64 KiB
-static const cl_uint ARGON_VER = 0x13;
+// Change via ENV: WALLET / POOL_PASS
+static const char *DEFAULT_WAL  = "DTXoRQ7Zpw3FVRW2DWkLrM9Skj4Gp9SeSj"; // <— change for production
+static const char *DEFAULT_PASS = "c=DOGE,ID=n2plus";                   // you can append sd= or d= via POOL_PASS
 
-// Batch-Konfiguration
-static cl_uint g_batch_size = 256; // Default 256, via RIN_BATCH steuerbar
-static cl_uint g_wgs = 0;          // 0 = Treiber wählt, via RIN_WGS steuerbar
+// Argon2d params
+#define M_COST_KB 64
+#define T_COST    2
+#define LANES     1
 
-// Debug / Optionen (per Env)
+// Batch default
+#define BATCH_DEFAULT 256
+
+// ============================ Globals / Debug =============================
 static int g_debug = 0;
-static int g_use_batch = 1;  // Batch-Kernel verwenden
-static int g_did_debug_for_job = 0; // Debug nur einmal pro Job
+
+// Share difficulty & target (BE)
+static double  g_share_diff = 1.0;
+static uint8_t g_share_target_be[32] = {
+    0x00,0x00,0x00,0x00, 0xFF,0xFF,0x00,0x00,
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0
+};
+static int g_diff_locked = 0;     // 1 if RIN_FORCE_DIFF or 'd=' in pass; ignore set_difficulty
 
 // ============================ Utils ==============================
 static void blake3_hash32(const uint8_t *in, size_t len, uint8_t out[32]) {
@@ -58,7 +77,7 @@ static void blake3_hash32(const uint8_t *in, size_t len, uint8_t out[32]) {
     blake3_hasher_finalize(&h, out, 32);
 }
 
-static void sha3_256(const uint8_t *in, size_t len, uint8_t out[32]) {
+static void sha3_256_once(const uint8_t *in, size_t len, uint8_t out[32]) {
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
     EVP_DigestInit_ex(ctx, EVP_sha3_256(), NULL);
     EVP_DigestUpdate(ctx, in, len);
@@ -86,38 +105,107 @@ static int hex2bin(const char *hex, uint8_t *out, size_t outlen) {
     }
     return 1;
 }
+
 static void hexdump(const char* name, const uint8_t* b, size_t n){
     printf("%s=", name);
     for (size_t i=0;i<n;i++) printf("%02x", b[i]);
     printf("\n");
 }
 
-static void target_from_nbits(uint32_t nbits, uint8_t target[32]) {
-    memset(target, 0, 32);
-    uint32_t exp = nbits >> 24;
-    uint32_t mant = nbits & 0xFFFFFFu;
-    if (exp <= 3) {
-        mant >>= 8*(3-exp);
-        target[29] = (mant >> 16) & 0xFF;
-        target[30] = (mant >> 8)  & 0xFF;
-        target[31] = mant & 0xFF;
-    } else {
-        int idx = 32 - exp; if (idx < 0) idx = 0;
-        if (idx + 3 <= 32) {
-            target[idx]   = (mant >> 16) & 0xFF;
-            target[idx+1] = (mant >> 8)  & 0xFF;
-            target[idx+2] = mant & 0xFF;
+static uint64_t mono_ms(void){
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec*1000ull + (uint64_t)ts.tv_nsec/1000000ull;
+}
+
+// ============================ 256-bit helpers =============================
+typedef struct { uint32_t v[8]; } u256le;
+
+static void u256le_set_diff1(u256le *a) {
+    for (int i=0;i<8;i++) a->v[i]=0;
+    a->v[6] = 0xFFFF0000u; // maps BE 00000000ffff0000........ in LE limbs
+}
+
+static void u256le_shl_bits(u256le *a, unsigned bits) {
+    if (bits >= 256) { for(int i=0;i<8;i++) a->v[i]=0; return; }
+    unsigned w = bits >> 5, b = bits & 31;
+    uint32_t tmp[8] = {0};
+    for (int i=7;i>=0;i--) {
+        uint64_t acc = 0;
+        if ((int)i - (int)w >= 0) {
+            acc = (uint64_t)a->v[i - w] << b;
+            if (b && (int)i - (int)w - 1 >= 0)
+                acc |= (uint64_t)a->v[i - w - 1] >> (32 - b);
         }
+        tmp[i] = (uint32_t)acc;
+    }
+    for (int i=0;i<8;i++) a->v[i]=tmp[i];
+}
+
+static void u256le_rshift_bits(u256le *a, unsigned bits) {
+    if (bits >= 256) { for(int i=0;i<8;i++) a->v[i]=0; return; }
+    unsigned w = bits >> 5, b = bits & 31;
+    uint32_t tmp[8]={0};
+    for (int i=0;i<8;i++) {
+        uint64_t acc = 0;
+        if (i + (int)w <= 7) {
+            acc = (uint64_t)a->v[i + w] >> b;
+            if (b && i + (int)w + 1 <= 7)
+                acc |= (uint64_t)a->v[i + w + 1] << (32 - b);
+        }
+        tmp[i] = (uint32_t)acc;
+    }
+    for (int i=0;i<8;i++) a->v[i]=tmp[i];
+}
+
+static void u256le_div_u64(const u256le *a, uint64_t d, u256le *q) {
+    uint64_t rem = 0;
+    for (int i=7;i>=0;i--) {
+        uint64_t cur = (rem << 32) | a->v[i];
+        uint64_t qi  = cur / d;
+        rem          = cur % d;
+        q->v[i] = (uint32_t)qi;
     }
 }
 
-// ========================== Stratum ==============================
+static void u256le_to_be_bytes(const u256le *a, uint8_t out_be[32]) {
+    for (int i=0;i<8;i++) {
+        uint32_t w = a->v[7-i];
+        out_be[i*4+0] = (uint8_t)(w >> 24);
+        out_be[i*4+1] = (uint8_t)(w >> 16);
+        out_be[i*4+2] = (uint8_t)(w >>  8);
+        out_be[i*4+3] = (uint8_t)(w      );
+    }
+}
+
+static void diff_to_target(double diff, uint8_t out_be[32]) {
+    if (diff <= 0.0) { memset(out_be, 0, 32); return; }
+    int e;
+    double f = frexp(diff, &e);                 // diff = f * 2^e, 0.5<=f<1
+    uint64_t m = (uint64_t)ldexp(f, 52);        // 52-bit mantissa
+    if (m == 0) { memset(out_be, 0xFF, 32); return; }
+    int shift = 52 - e;                         // target = floor((diff1 << shift)/m)
+    u256le num; u256le_set_diff1(&num);
+    if (shift >= 0) u256le_shl_bits(&num, (unsigned)shift);
+    else            u256le_rshift_bits(&num, (unsigned)(-shift));
+    u256le q; u256le_div_u64(&num, m, &q);
+    u256le_to_be_bytes(&q, out_be);
+}
+
+static int hash_meets_target_be(const uint8_t hash_be[32], const uint8_t target_be[32]) {
+    for (int i = 0; i < 32; i++) {
+        if (hash_be[i] < target_be[i]) return 1;
+        if (hash_be[i] > target_be[i]) return 0;
+    }
+    return 1;
+}
+
+// ============================ Stratum ==============================
 typedef struct {
     char host[256];
     int  port;
     int  sock;
-    char wallet[128];
-    char pass[128];
+    char wallet[256];
+    char pass[512];
     char extranonce1[64];
     cl_uint extranonce2_size;
 } stratum_ctx_t;
@@ -141,10 +229,12 @@ static int set_nonblock(int s, int on) {
     if (on) flags |= O_NONBLOCK; else flags &= ~O_NONBLOCK;
     return fcntl(s, F_SETFL, flags);
 }
+
 static int is_numeric_ip(const char *s) {
     struct in6_addr a6; struct in_addr a4;
     return inet_pton(AF_INET, s, &a4) == 1 || inet_pton(AF_INET6, s, &a6) == 1;
 }
+
 static int sock_connect_verbose(const char *host, int port, int timeout_ms) {
     if (is_numeric_ip(host)) {
         int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -152,7 +242,7 @@ static int sock_connect_verbose(const char *host, int port, int timeout_ms) {
         struct sockaddr_in sa; memset(&sa,0,sizeof sa);
         sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);
         if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) { close(s); return -1; }
-        if (set_nonblock(s, 1) != 0) { perror("fcntl"); close(s); return -1; }
+        if (set_nonblock(s, 1) != 0) { perror("fcntl(O_NONBLOCK)"); close(s); return -1; }
         int rc = connect(s, (struct sockaddr*)&sa, sizeof sa);
         if (rc != 0 && errno != EINPROGRESS) { perror("connect"); close(s); return -1; }
         fd_set wfds; FD_ZERO(&wfds); FD_SET(s, &wfds);
@@ -160,10 +250,13 @@ static int sock_connect_verbose(const char *host, int port, int timeout_ms) {
         rc = select(s+1, NULL, &wfds, NULL, &tv);
         if (rc <= 0) { if (rc==0) fprintf(stderr,"connect timeout %s\n", host); else perror("select"); close(s); return -1; }
         int soerr=0; socklen_t slen=sizeof soerr;
-        if (getsockopt(s,SOL_SOCKET,SO_ERROR,&soerr,&slen)<0 || soerr!=0){ if(soerr) fprintf(stderr,"connect error: %s\n", strerror(soerr)); else perror("getsockopt"); close(s); return -1; }
-        fprintf(stderr,"Connected to %s (numeric IP)\n", host);
+        if (getsockopt(s,SOL_SOCKET,SO_ERROR,&soerr,&slen)<0 || soerr!=0){
+            fprintf(stderr,"connect() error: %s\n", soerr?strerror(soerr):"getsockopt");
+            close(s); return -1;
+        }
         return s;
     }
+
     struct addrinfo hints = {0}, *res=NULL, *p=NULL;
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
@@ -179,44 +272,21 @@ static int sock_connect_verbose(const char *host, int port, int timeout_ms) {
 
     int s = -1;
     for (p = res; p; p = p->ai_next) {
-        char addrbuf[128] = {0};
-        void *aptr = NULL;
-        if (p->ai_family == AF_INET)  aptr = &((struct sockaddr_in*)p->ai_addr)->sin_addr;
-        if (p->ai_family == AF_INET6) aptr = &((struct sockaddr_in6*)p->ai_addr)->sin6_addr;
-        if (aptr) inet_ntop(p->ai_family, aptr, addrbuf, sizeof addrbuf);
-
         s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (s < 0) { perror("socket"); continue; }
-
-        if (set_nonblock(s, 1) != 0) { perror("fcntl(O_NONBLOCK)"); close(s); s=-1; continue; }
-
+        if (s < 0) continue;
+        if (set_nonblock(s, 1) != 0) { close(s); s=-1; continue; }
         int rc = connect(s, p->ai_addr, p->ai_addrlen);
-        if (rc != 0 && errno != EINPROGRESS) {
-            fprintf(stderr, "connect() to %s (%s) failed: %s\n", host, addrbuf[0]?addrbuf:"?", strerror(errno));
-            close(s); s=-1; continue;
-        }
+        if (rc != 0 && errno != EINPROGRESS) { close(s); s=-1; continue; }
         fd_set wfds; FD_ZERO(&wfds); FD_SET(s, &wfds);
         struct timeval tv = { .tv_sec = timeout_ms/1000, .tv_usec = (timeout_ms%1000)*1000 };
         rc = select(s+1, NULL, &wfds, NULL, &tv);
-        if (rc <= 0) {
-            if (rc == 0) fprintf(stderr, "connect() timeout to %s (%s)\n", host, addrbuf[0]?addrbuf:"?");
-            else perror("select(connect)");
-            close(s); s = -1; continue;
-        }
+        if (rc <= 0) { close(s); s=-1; continue; }
         int soerr=0; socklen_t slen=sizeof soerr;
-        if (getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0 || soerr != 0) {
-            fprintf(stderr, "connect() error after select to %s (%s): %s\n", host, addrbuf[0]?addrbuf:"?", (soerr?strerror(soerr):"getsockopt failed"));
-            close(s); s = -1; continue;
-        }
-        fprintf(stderr, "Connected to %s (%s)\n", host, addrbuf[0]?addrbuf:"?");
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0 || soerr != 0) { close(s); s=-1; continue; }
         break;
     }
 
     freeaddrinfo(res);
-    if (s < 0) {
-        fprintf(stderr, "All address candidates for %s:%d failed.\n", host, port);
-        return -1;
-    }
     return s;
 }
 
@@ -234,7 +304,7 @@ static int send_line_verbose(int s, const char *line) {
     return 1;
 }
 
-// -------- robuster Zeilenpuffer --------
+// -------- Zeilenpuffer --------
 static char inbuf[65536];
 static size_t inlen = 0;
 
@@ -262,7 +332,7 @@ static int next_line(char *out, size_t cap) {
     return 0;
 }
 
-// --- Subscribe-Parsing (extranonce sauber) ---
+// --- Subscribe parsing (extranonce) ---
 static const char* find_after_result_array_first(const char *s) {
     const char *p = strstr(s, "\"result\""); if (!p) return NULL;
     p = strchr(p, '['); if (!p) return NULL;
@@ -292,17 +362,59 @@ static int parse_subscribe_result(const char *line, char *ex1, size_t ex1cap, cl
     return 1;
 }
 
+// Parse set_difficulty line
+static int parse_set_difficulty_line(const char *line, double *out_diff) {
+    const char *p = strstr(line, "mining.set_difficulty");
+    if (!p) return 0;
+    p = strstr(p, "\"params\"");
+    if (!p) return 0;
+    p = strchr(p, '[');
+    if (!p) return 0;
+    p++;
+    while (*p==' '||*p=='\t') p++;
+    char *endp=NULL;
+    double d = strtod(p, &endp);
+    if (endp == p) return 0;
+    *out_diff = d;
+    return 1;
+}
+
+// Parse diff from password (d= locks; sd= start)
+static int parse_diff_from_pass(const char *pass, double *out_diff, int *out_locked) {
+    if (!pass || !*pass) return 0;
+    const char *p = pass;
+    double found = 0.0; int have = 0; int locked = 0;
+    while (*p) {
+        while (*p == ' ' || *p == ',' || *p == ';') p++;
+        if (!*p) break;
+        const char *k = p;
+        while (*p && *p != ',' && *p != ';') p++;
+        size_t L = (size_t)(p - k);
+        if (L >= 2 && !strncmp(k,"d=",2)) {
+            found = strtod(k+2, NULL); have=1; locked=1; // hard diff
+        } else if (L >= 3 && !strncmp(k,"sd=",3)) {
+            if (!locked) { found = strtod(k+3, NULL); have=1; }
+        }
+    }
+    if (have && found > 0.0) {
+        *out_diff = found;
+        *out_locked = locked;
+        return 1;
+    }
+    return 0;
+}
+
 static int stratum_connect_one(stratum_ctx_t *C,const char *host,int port,const char *user,const char *pass){
     memset(C,0,sizeof *C);
     snprintf(C->host,sizeof C->host,"%s",host); C->port=port;
     snprintf(C->wallet,sizeof C->wallet,"%s",user);
-    snprintf(C->pass,sizeof C->pass,"%s",pass);
+    snprintf(C->pass,sizeof C->pass,"%s",pass ? pass : "");
 
     C->sock = sock_connect_verbose(host, port, 5000);
     if (C->sock < 0) return 0;
 
     char sub[256];
-    snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/0.9\"]}\n");
+    snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"rin-ocl/1.0\"]}\n");
     if(!send_line_verbose(C->sock,sub)) { fprintf(stderr,"Stratum send subscribe failed\n"); close(C->sock); return 0; }
 
     time_t t0=time(NULL); char line[16384];
@@ -315,6 +427,16 @@ static int stratum_connect_one(stratum_ctx_t *C,const char *host,int port,const 
                     have_ex = 1; break;
                 }
             }
+            // set_difficulty can arrive any time
+            double dtmp;
+            if (!g_diff_locked && parse_set_difficulty_line(line, &dtmp)) {
+                g_share_diff = dtmp;
+                diff_to_target(g_share_diff, g_share_target_be);
+                if (g_debug) {
+                    printf("[DIFF] set_difficulty=%.8f\n", g_share_diff);
+                    printf("[DIFF] share_target="); for(int i=0;i<32;i++) printf("%02x", g_share_target_be[i]); printf("\n");
+                }
+            }
         }
         if (have_ex) break;
     }
@@ -325,15 +447,16 @@ static int stratum_connect_one(stratum_ctx_t *C,const char *host,int port,const 
     if (!C->extranonce1[0]) snprintf(C->extranonce1,sizeof C->extranonce1,"00000000");
     if (!C->extranonce2_size) C->extranonce2_size = 4;
 
-    char auth[512];
-    snprintf(auth,sizeof auth,"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}\n",C->wallet,C->pass);
+    char auth[1536];
+    int nw = snprintf(auth,sizeof auth,"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}\n",C->wallet,C->pass);
+    if (nw <= 0 || (size_t)nw >= sizeof auth) { fprintf(stderr,"authorize snprintf overflow\n"); close(C->sock); return 0; }
     if(!send_line_verbose(C->sock,auth)) { fprintf(stderr,"Stratum send authorize failed\n"); close(C->sock); return 0; }
 
-    t0=time(NULL);
-    while (time(NULL)-t0 < 2) { recv_into_buffer(C->sock, 200); while(next_line(line,sizeof line)){} }
+    // Drain early chatter briefly
+    time_t t1=time(NULL);
+    while (time(NULL)-t1 < 2) { recv_into_buffer(C->sock, 200); char dump[16384]; while(next_line(dump,sizeof dump)){} }
 
-    printf("Connected to %s:%d\nExtranonce1=%s, extranonce2_size=%u\n",
-           C->host,C->port,C->extranonce1,(unsigned)C->extranonce2_size);
+    printf("Connected. extranonce1=%s ex2_size=%u  (Batch=%u)\n", C->extranonce1, (unsigned)C->extranonce2_size, (unsigned)BATCH_DEFAULT);
     return 1;
 }
 
@@ -342,12 +465,10 @@ static int stratum_connect_any(stratum_ctx_t *C, const char **hosts, int port, c
     const char *env_port = getenv("POOL_PORT");
     if (env_host && env_host[0]) {
         int p = (env_port && env_port[0]) ? atoi(env_port) : port;
-        fprintf(stderr, "Trying POOL_HOST from ENV: %s:%d\n", env_host, p);
         if (stratum_connect_one(C, env_host, p, user, pass)) return 1;
         fprintf(stderr, "ENV host failed, falling back to default list…\n");
     }
     for (int i = 0; hosts[i]; i++) {
-        fprintf(stderr, "Trying %s:%d …\n", hosts[i], port);
         if (stratum_connect_one(C, hosts[i], port, user, pass)) return 1;
     }
     return 0;
@@ -375,6 +496,7 @@ static int stratum_parse_notify(const char *line, stratum_job_t *J){
     if(!get_next_quoted(p,rb,J->coinb1_hex,sizeof J->coinb1_hex)) return 0;
     if(!get_next_quoted(p,rb,J->coinb2_hex,sizeof J->coinb2_hex)) return 0;
 
+    // merkle array
     J->merkle_count = 0;
     const char *m_lb=strchr(p,'['), *m_rb=NULL;
     if (m_lb) { const char *scan=m_lb+1; for(;scan<rb;scan++){ if(*scan==']'){ m_rb=scan; break; }}}
@@ -384,10 +506,12 @@ static int stratum_parse_notify(const char *line, stratum_job_t *J){
             char tmp[65]; if(!get_next_quoted(mp,m_rb,tmp,sizeof tmp)) break;
             snprintf(J->merkle_hex[J->merkle_count],65,"%s",tmp);
             J->merkle_count++;
+            mp = strchr(mp+1,'"'); if(!mp) break;
         }
         p = m_rb+1;
     }
 
+    // version, nbits, ntime (hex strings)
     char vhex[16]={0}, nbhex[16]={0}, nth[16]={0};
     if(!get_next_quoted(p,rb,vhex,sizeof vhex)) return 0; sscanf(vhex,"%x",&J->version);
     if(!get_next_quoted(p,rb,nbhex,sizeof nbhex)) return 0; sscanf(nbhex,"%x",&J->nbits);
@@ -397,59 +521,75 @@ static int stratum_parse_notify(const char *line, stratum_job_t *J){
     return 1;
 }
 
-static int stratum_get_job(stratum_ctx_t *C, stratum_job_t *J){
-    char line[16384]; int got=0;
-    recv_into_buffer(C->sock, 0);
-    while (next_line(line,sizeof line)) {
-        if (strstr(line,"\"mining.notify\"")) {
-            if (stratum_parse_notify(line,J)) { got=1; break; }
-        }
-    }
-    return got;
-}
-
 static void stratum_wait_submit_ack(int sock) {
     char line[4096];
-    uint64_t start = 0;
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    start = (uint64_t)ts.tv_sec*1000ull + ts.tv_nsec/1000000ull;
-
-    while (1) {
+    uint64_t start = mono_ms();
+    while (mono_ms() - start <= 3000) {
         recv_into_buffer(sock, 0);
         while (next_line(line, sizeof line)) {
             if (strstr(line, "\"id\":4")) {
                 if (strstr(line, "\"result\":true")) {
-                    printf(" -> ACCEPTED\n");
-                    fflush(stdout);
-                    return;
+                    printf(" -> ACCEPTED\n"); fflush(stdout); return;
                 } else if (strstr(line, "\"error\"")) {
-                    printf(" -> REJECTED: %s", line);
-                    fflush(stdout);
-                    return;
+                    printf(" -> REJECTED: %s", line); fflush(stdout); return;
+                }
+            }
+            double dtmp;
+            if (!g_diff_locked && parse_set_difficulty_line(line, &dtmp)) {
+                g_share_diff = dtmp;
+                diff_to_target(g_share_diff, g_share_target_be);
+                if (g_debug) {
+                    printf("[DIFF] set_difficulty=%.8f\n", g_share_diff);
+                    printf("[DIFF] share_target="); for(int i=0;i<32;i++) printf("%02x", g_share_target_be[i]); printf("\n");
                 }
             }
         }
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        uint64_t now = (uint64_t)ts.tv_sec*1000ull + ts.tv_nsec/1000000ull;
-        if (now - start > 1200) return;
         usleep(20000);
     }
 }
 
+static size_t build_submit_json(char *req, size_t cap,
+                                const char *wallet, const char *job_id,
+                                const char *ex2_hex, uint32_t ntime_le, uint32_t nonce_le) {
+    char ntime_hex[9], nonce_hex[9];
+    snprintf(ntime_hex, sizeof ntime_hex, "%08x", ntime_le);
+    snprintf(nonce_hex, sizeof nonce_hex, "%08x", nonce_le);
+    return (size_t)snprintf(req, cap,
+        "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}\n",
+        wallet, job_id, ex2_hex, ntime_hex, nonce_hex);
+}
+
 static int stratum_submit(stratum_ctx_t *C,const stratum_job_t *J,
                           const char *extranonce2_hex,uint32_t ntime_le,uint32_t nonce_le){
-    char ntime_hex[9], nonce_hex[9];
-    snprintf(ntime_hex,9,"%08x",ntime_le);
-    snprintf(nonce_hex,9,"%08x",nonce_le);
-    char req[512];
-    snprintf(req,sizeof req,
-      "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}\n",
-      C->wallet, J->job_id, extranonce2_hex, ntime_hex, nonce_hex);
+    char req[1536];
+    size_t n = build_submit_json(req, sizeof req, C->wallet, J->job_id, extranonce2_hex, ntime_le, nonce_le);
+    if (n == 0 || n >= sizeof req) { fprintf(stderr,"submit snprintf overflow\n"); return 0; }
     int ok = send_line_verbose(C->sock,req);
     if (ok) stratum_wait_submit_ack(C->sock);
     return ok;
 }
 
+// nbits -> target (for info only)
+static void target_from_nbits(uint32_t nbits, uint8_t target[32]) {
+    memset(target, 0, 32);
+    uint32_t exp = nbits >> 24;
+    uint32_t mant = nbits & 0xFFFFFFu;
+    if (exp <= 3) {
+        mant >>= 8*(3-exp);
+        target[29] = (mant >> 16) & 0xFF;
+        target[30] = (mant >> 8)  & 0xFF;
+        target[31] = mant & 0xFF;
+    } else {
+        int idx = 32 - (int)exp; if (idx < 0) idx = 0;
+        if (idx + 3 <= 32) {
+            target[idx]   = (mant >> 16) & 0xFF;
+            target[idx+1] = (mant >> 8)  & 0xFF;
+            target[idx+2] = mant & 0xFF;
+        }
+    }
+}
+
+// merkle (LE) aus coinbase-hash (BE) + branches (hex BE)
 static void build_merkle_root_le(const uint8_t cb_be[32], char merkle_hex[][65], int mcount, uint8_t out_le[32]) {
     uint8_t h_le[32]; for (int i=0;i<32;i++) h_le[i]=cb_be[31-i];
     for (int i=0;i<mcount;i++){
@@ -475,7 +615,7 @@ static void build_header_le(const stratum_job_t *J, const uint8_t prevhash_le[32
     memcpy(out80+76,&nonce,4);
 }
 
-// ============================ OpenCL =============================
+// ============================ OpenCL helpers ======================
 static char* load_kernel_source_try(const char *path) {
     FILE *f=fopen(path,"rb");
     if(!f) return NULL;
@@ -499,280 +639,338 @@ static char* load_kernel_source(const char *filename) {
     exit(1);
 }
 
-static inline uint64_t mono_ms(void){
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec*1000ull + (uint64_t)ts.tv_nsec/1000000ull;
-}
-
-static void check_arg(const char* name, cl_int e, int idx){
-    if (e != CL_SUCCESS){
-        fprintf(stderr, "clSetKernelArg(%s, idx=%d) failed: %d\n", name, idx, e);
-        exit(1);
-    }
-}
-
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int sig){ (void)sig; g_stop = 1; }
 
-// ============================== MAIN ============================
-int main(int argc, char **argv) {
-   signal(SIGINT, on_sigint);
+// --- Batch arg setter that adapts to kernel signature to avoid CL_INVALID_KERNEL_ARGS (-52)
+static int set_batch_kernel_args_adaptive(cl_kernel k_batch,
+                                          cl_mem d_prehash, cl_mem d_mem, cl_mem d_out,
+                                          cl_uint num_items, cl_uint blocks_per_lane) {
+    cl_int err;
+    err  = clSetKernelArg(k_batch, 0, sizeof(cl_mem), &d_prehash);
+    err |= clSetKernelArg(k_batch, 1, sizeof(cl_mem), &d_mem);
+    err |= clSetKernelArg(k_batch, 2, sizeof(cl_mem), &d_out);
+    err |= clSetKernelArg(k_batch, 3, sizeof(cl_uint), &num_items);
+    err |= clSetKernelArg(k_batch, 4, sizeof(cl_uint), &blocks_per_lane);
+    if (err != CL_SUCCESS) return err;
 
-   // ENV-Variablen lesen
-   if (getenv("RIN_DEBUG")) g_debug = atoi(getenv("RIN_DEBUG"));
-   if (getenv("RIN_BATCH")) {
-       g_batch_size = (cl_uint)atoi(getenv("RIN_BATCH"));
-       if (g_batch_size < 16) g_batch_size = 16;
-       if (g_batch_size > 1024) g_batch_size = 1024;
-   }
-   if (getenv("RIN_WGS")) {
-       g_wgs = (cl_uint)atoi(getenv("RIN_WGS"));
-   }
+    cl_uint num_args = 5;
+    clGetKernelInfo(k_batch, CL_KERNEL_NUM_ARGS, sizeof(num_args), &num_args, NULL);
+    if (num_args <= 5) return CL_SUCCESS;
 
-   printf("=== RinHash Batch-GPU Miner ===\n");
-   printf("Batch size: %u (via RIN_BATCH, default 256)\n", g_batch_size);
-   printf("Work group size: %s\n", g_wgs ? "custom" : "auto (driver chooses)");
-   printf("Memory: %u KiB per instance (spec-compliant)\n", M_COST_KB);
-   printf("Argon2d params: t=%u, m=%u KiB, p=1, salt=RinCoinSalt, ver=0x%02x\n",
-          T_COST, M_COST_KB, ARGON_VER);
+    cl_uint tcost = T_COST;
+    cl_uint lanes = LANES;
+    cl_uint do_init = 1u;
+    cl_uint zero = 0u;
 
-   // OpenCL Setup
-   cl_int err; cl_platform_id plat; cl_device_id dev;
-   clGetPlatformIDs(1,&plat,NULL);
-   err = clGetDeviceIDs(plat,CL_DEVICE_TYPE_GPU,1,&dev,NULL);
-   if (err!=CL_SUCCESS){ fprintf(stderr,"No GPU device found\n"); return 1; }
-
-   char devname[256]; clGetDeviceInfo(dev,CL_DEVICE_NAME,sizeof devname,devname,NULL);
-   printf("Device: %s\n", devname);
-
-   cl_context ctx = clCreateContext(NULL,1,&dev,NULL,NULL,&err);
-   cl_command_queue q = clCreateCommandQueue(ctx,dev,0,&err);
-   if (err!=CL_SUCCESS){ fprintf(stderr,"clCreateCommandQueue: %d\n",err); return 1; }
-
-   char *ksrc = load_kernel_source("rinhash_argon2d.cl");
-   cl_program prog = clCreateProgramWithSource(ctx,1,(const char**)&ksrc,NULL,&err);
-   err = clBuildProgram(prog,1,&dev,"-cl-std=CL1.2",NULL,NULL);
-   if (err!=CL_SUCCESS){
-       size_t L; clGetProgramBuildInfo(prog,dev,CL_PROGRAM_BUILD_LOG,0,NULL,&L);
-       char *log=(char*)malloc(L+1); clGetProgramBuildInfo(prog,dev,CL_PROGRAM_BUILD_LOG,L,log,NULL);
-       log[L]=0; fprintf(stderr,"Build failed:\n%s\n",log); free(log); return 1;
-   }
-
-   // Versuche Batch-Kernel, sonst Fallback
-   cl_kernel batch_kernel = clCreateKernel(prog,"argon2d_batch",&err);
-   cl_kernel fallback_kernel = NULL;
-   if (err != CL_SUCCESS) {
-       printf("Batch kernel not found, using fallback single-nonce mode\n");
-       g_use_batch = 0;
-       fallback_kernel = clCreateKernel(prog,"argon2d_core",&err);
-       if (err != CL_SUCCESS) {
-           fprintf(stderr,"Neither batch nor core kernel found!\n");
-           return 1;
-       }
-   } else {
-       printf("Using batch kernel for parallel processing\n");
-   }
-
-   // Batch-Puffer anlegen
-   uint8_t *prehash_batch = (uint8_t*)malloc(32 * g_batch_size);
-   uint8_t *argon_out_batch = (uint8_t*)malloc(32 * g_batch_size);
-   
-   cl_mem d_prehash = clCreateBuffer(ctx, CL_MEM_READ_ONLY,  32 * g_batch_size, NULL, &err);
-   cl_mem d_mem     = clCreateBuffer(ctx, CL_MEM_READ_WRITE, 65536ULL * g_batch_size, NULL, &err);
-   cl_mem d_out     = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, 32 * g_batch_size, NULL, &err);
-
-   // Fallback-Puffer (falls Batch nicht geht)
-   cl_mem d_phash_single = NULL, d_mem_single = NULL, d_out_single = NULL;
-   if (!g_use_batch) {
-       d_phash_single = clCreateBuffer(ctx, CL_MEM_READ_ONLY, 32, NULL, &err);
-       d_mem_single   = clCreateBuffer(ctx, CL_MEM_READ_WRITE, 65536, NULL, &err);
-       d_out_single   = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, 32, NULL, &err);
-   }
-
-   // ===== Stratum =====
-   int PORT = getenv("POOL_PORT") ? atoi(getenv("POOL_PORT")) : PORT_DEFAULT;
-   stratum_ctx_t S;
-   if(!stratum_connect_any(&S, POOL_CANDIDATES, PORT, WAL, PASS)){
-       fprintf(stderr,"Stratum connect failed (all hosts)\n");
-       return 1;
-   }
-
-   uint8_t prevhash_le[32], merkleroot_le[32], target_be[32];
-   stratum_job_t J={0}, Jnew={0}; int have_job=0;
-
-   uint64_t total_hashes = 0;
-   uint64_t t_poll  = mono_ms();
-   uint64_t t_stats = mono_ms();
-   
-   static cl_uint batch_nonce_base = 0;
-   static cl_uint en2_counter = 1;
-
-   while (!g_stop) {
-       // Stratum-Polling (alle 100ms)
-       if (mono_ms() - t_poll >= 100) {
-           while (stratum_get_job(&S, &Jnew)) {
-               if (!have_job || strcmp(Jnew.job_id, J.job_id) != 0 || Jnew.clean) {
-                   J = Jnew; have_job = 1;
-                   g_did_debug_for_job = 0;  // Reset debug flag für neuen Job
-                   batch_nonce_base = 0;     // Nonce-Zähler zurücksetzen
-                   
-                   uint8_t prev_be[32]; hex2bin(J.prevhash_hex, prev_be, 32);
-                   for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be[31 - i];
-                   target_from_nbits(J.nbits, target_be);
-                   printf("\n=== New Job: %s ===\n", J.job_id);
-                   printf("nbits=%08x ntime=%08x\n", J.nbits, J.ntime);
-                   fflush(stdout);
-               }
-           }
-           t_poll = mono_ms();
-       }
-       if (!have_job) { usleep(10000); continue; }
-
-       // === Batch-Mining ===
-       if (g_use_batch) {
-           // Coinbase/Merkle für diesen Batch
-           uint8_t coinb1[4096], coinb2[4096];
-           size_t cb1 = strlen(J.coinb1_hex) / 2, cb2 = strlen(J.coinb2_hex) / 2;
-           hex2bin(J.coinb1_hex, coinb1, cb1);
-           hex2bin(J.coinb2_hex, coinb2, cb2);
-
-           uint8_t en1[64]; size_t en1b = strlen(S.extranonce1) / 2; 
-           if (en1b > 64) en1b = 64;
-           hex2bin(S.extranonce1, en1, en1b);
-           
-           // Extranonce2 für Batch
-           char en2_hex[64];
-           snprintf(en2_hex, sizeof en2_hex, "%0*x", S.extranonce2_size * 2, en2_counter++);
-           uint8_t en2[64]; hex2bin(en2_hex, en2, S.extranonce2_size);
-
-           uint8_t coinbase[8192]; size_t off = 0;
-           memcpy(coinbase + off, coinb1, cb1); off += cb1;
-           memcpy(coinbase + off, en1, en1b); off += en1b;
-           memcpy(coinbase + off, en2, S.extranonce2_size); off += S.extranonce2_size;
-           memcpy(coinbase + off, coinb2, cb2); off += cb2;
-
-           uint8_t cbh_be[32]; double_sha256(coinbase, off, cbh_be);
-           build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
-
-           // Batch mit fortlaufenden Nonces füllen
-           for (cl_uint i = 0; i < g_batch_size; i++) {
-               uint8_t header[80];
-               uint32_t nonce = batch_nonce_base + i;
-               build_header_le(&J, prevhash_le, merkleroot_le, J.ntime, J.nbits, nonce, header);
-               blake3_hash32(header, 80, prehash_batch + i*32);
-           }
-
-           // Async Transfer zur GPU
-           cl_event ev_w;
-           clEnqueueWriteBuffer(q, d_prehash, CL_FALSE, 0, 32*g_batch_size, 
-                              prehash_batch, 0, NULL, &ev_w);
-
-           // Kernel-Args setzen
-           err = clSetKernelArg(batch_kernel, 0, sizeof(cl_mem), &d_prehash);
-           check_arg("prehashes", err, 0);
-           err = clSetKernelArg(batch_kernel, 1, sizeof(cl_mem), &d_mem);
-           check_arg("mem", err, 1);
-           err = clSetKernelArg(batch_kernel, 2, sizeof(cl_mem), &d_out);
-           check_arg("out32", err, 2);
-           err = clSetKernelArg(batch_kernel, 3, sizeof(cl_uint), &g_batch_size);
-           check_arg("num_items", err, 3);
-           cl_uint blocks = M_COST_KB;  // 64
-           err = clSetKernelArg(batch_kernel, 4, sizeof(cl_uint), &blocks);
-           check_arg("blocks_per_lane", err, 4);
-           err = clSetKernelArg(batch_kernel, 5, sizeof(cl_uint), &T_COST);
-           check_arg("t_cost", err, 5);
-
-           // Kernel starten (warte auf Write-Event)
-           size_t global = g_batch_size;
-           size_t local_size = g_wgs;
-           size_t *local = (g_wgs > 0) ? &local_size : NULL;
-           
-           uint64_t t_kernel_start = mono_ms();
-           err = clEnqueueNDRangeKernel(q, batch_kernel, 1, NULL, &global, local, 
-                                       1, &ev_w, NULL);
-           if (err != CL_SUCCESS) {
-               fprintf(stderr, "Kernel launch failed: %d\n", err);
-               exit(1);
-           }
-           clReleaseEvent(ev_w);
-           clFinish(q);
-           uint64_t t_kernel_end = mono_ms();
-
-           // Ergebnisse lesen
-           clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32*g_batch_size, 
-                             argon_out_batch, 0, NULL, NULL);
-
-           // Debug beim ersten Batch des Jobs
-           if (g_debug && !g_did_debug_for_job) {
-               printf("[DEBUG] First batch of job %s:\n", J.job_id);
-               hexdump("prehash[0]", prehash_batch, 32);
-               hexdump("gpu_argon2[0]", argon_out_batch, 32);
-               g_did_debug_for_job = 1;
-           }
-
-           // Ergebnisse prüfen
-           for (cl_uint i = 0; i < g_batch_size; i++) {
-               uint8_t final_hash[32];
-               sha3_256(argon_out_batch + i*32, 32, final_hash);
-               
-               // Target-Vergleich (BE)
-               int ok = 1;
-               for (int j = 0; j < 32; j++) {
-                   if (final_hash[j] < target_be[j]) { ok = 1; break; }
-                   if (final_hash[j] > target_be[j]) { ok = 0; break; }
-               }
-               
-               if (ok) {
-                   uint32_t nonce = batch_nonce_base + i;
-                   printf("\nFOUND share! ntime=%08x nonce=%08x", J.ntime, nonce);
-                   fflush(stdout);
-                   stratum_submit(&S, &J, en2_hex, J.ntime, nonce);
-               }
-           }
-
-           batch_nonce_base += g_batch_size;
-           total_hashes += g_batch_size;
-
-           // Statistik
-           if (mono_ms() - t_stats >= 5000) {
-               double secs = (mono_ms() - t_stats) / 1000.0;
-               double rate = total_hashes / secs;
-               double kernel_ms = t_kernel_end - t_kernel_start;
-               printf("\rHashrate: %.1f H/s | Batch time: %.1fms | Job: %s        ", 
-                      rate, kernel_ms, J.job_id);
-               fflush(stdout);
-               t_stats = mono_ms();
-               total_hashes = 0;
-           }
-
-       } else {
-           // === Fallback: Single-Nonce Loop (alter Code) ===
-           fprintf(stderr, "Fallback mode not fully implemented\n");
-           break;
-       }
-
-       usleep(1000); // Kurze Pause zwischen Batches
-   }
-
-   // Cleanup
-   if (batch_kernel) clReleaseKernel(batch_kernel);
-   if (fallback_kernel) clReleaseKernel(fallback_kernel);
-   clReleaseProgram(prog);
-   clReleaseMemObject(d_prehash);
-   clReleaseMemObject(d_mem);
-   clReleaseMemObject(d_out);
-   if (d_phash_single) clReleaseMemObject(d_phash_single);
-   if (d_mem_single) clReleaseMemObject(d_mem_single);
-   if (d_out_single) clReleaseMemObject(d_out_single);
-   clReleaseCommandQueue(q);
-   clReleaseContext(ctx);
-   close(S.sock);
-   free(ksrc);
-   free(prehash_batch);
-   free(argon_out_batch);
-   
-   printf("\nShutdown complete.\n");
-   return 0;
+    cl_uint extras[4] = { tcost, lanes, do_init, zero };
+    for (cl_uint i = 5, j = 0; i < num_args && j < 4; ++i, ++j) {
+        err = clSetKernelArg(k_batch, i, sizeof(cl_uint), &extras[j]);
+        if (err == CL_INVALID_ARG_SIZE || err == CL_INVALID_ARG_VALUE) {
+            cl_mem alt = (i % 2) ? d_out : d_mem;
+            err = clSetKernelArg(k_batch, i, sizeof(cl_mem), &alt);
+        }
+        if (err != CL_SUCCESS) return err;
+    }
+    return CL_SUCCESS;
 }
 
+// ============================== MAIN ============================
+int main(int argc, char **argv) {
+    signal(SIGINT, on_sigint);
+
+    // ENV
+    if (getenv("RIN_DEBUG")) g_debug = atoi(getenv("RIN_DEBUG"));
+
+    cl_uint BATCH = BATCH_DEFAULT;
+    if (getenv("RIN_BATCH")) {
+        int b = atoi(getenv("RIN_BATCH"));
+        if (b > 0 && b <= 4096) BATCH = (cl_uint)b;
+    }
+
+    // Wallet/Pass from env
+    const char *wallet_env = getenv("WALLET");
+    const char *pass_env   = getenv("POOL_PASS");
+    const char *WAL  = wallet_env && wallet_env[0] ? wallet_env : DEFAULT_WAL;
+    const char *PASS = pass_env   && pass_env[0]   ? pass_env   : DEFAULT_PASS;
+
+    // Optional forced share diff (locks)
+    const char *force_d_env = getenv("RIN_FORCE_DIFF");
+    if (force_d_env && force_d_env[0]) {
+        g_share_diff = atof(force_d_env);
+        if (g_share_diff < 1e-12) g_share_diff = 1e-12;
+        diff_to_target(g_share_diff, g_share_target_be);
+        g_diff_locked = 1;
+        printf("[FORCE] share difficulty=%.12f (locked)\n", g_share_diff);
+        if (g_debug) {
+            printf("[FORCE] share_target="); for(int i=0;i<32;i++) printf("%02x", g_share_target_be[i]); printf("\n");
+        }
+    } else {
+        // If pass contains d= or sd=, use it to set initial share target.
+        double pdiff=0.0; int locked=0;
+        if (parse_diff_from_pass(PASS, &pdiff, &locked) && pdiff > 0.0) {
+            g_share_diff = pdiff;
+            diff_to_target(g_share_diff, g_share_target_be);
+            g_diff_locked = locked ? 1 : 0;
+            printf("[PASS] initial difficulty=%.12f%s\n", g_share_diff, locked?" (locked via d=)":" (start via sd=)");
+            if (g_debug) {
+                printf("[PASS] share_target="); for(int i=0;i<32;i++) printf("%02x", g_share_target_be[i]); printf("\n");
+            }
+        }
+    }
+
+    printf("=== RinHash Batch-GPU Miner ===\n");
+    printf("Batch size: %u\n", BATCH);
+    printf("Wallet: %s\n", WAL);
+
+    // OpenCL Setup
+    cl_int err; cl_platform_id plat; cl_device_id dev;
+    cl_uint np=0; clGetPlatformIDs(1,&plat,&np);
+    if (np==0){ fprintf(stderr,"No OpenCL platform\n"); return 1; }
+    err = clGetDeviceIDs(plat,CL_DEVICE_TYPE_GPU,1,&dev,NULL);
+    if (err!=CL_SUCCESS){ fprintf(stderr,"No GPU device\n"); return 1; }
+
+    char devname[256]={0}; clGetDeviceInfo(dev,CL_DEVICE_NAME,sizeof devname,devname,NULL);
+    printf("Device: %s\n", devname);
+
+    cl_context ctx = clCreateContext(NULL,1,&dev,NULL,NULL,&err);
+    cl_command_queue q = clCreateCommandQueue(ctx,dev,0,&err);
+    if (err!=CL_SUCCESS){ fprintf(stderr,"clCreateCommandQueue: %d\n",err); return 1; }
+
+    // Build program
+    char *ksrc = load_kernel_source("rinhash_argon2d.cl");
+    cl_program prog = clCreateProgramWithSource(ctx,1,(const char**)&ksrc,NULL,&err);
+    err = clBuildProgram(prog,1,&dev,"-cl-std=CL1.2",NULL,NULL);
+    if (err!=CL_SUCCESS){
+        size_t L; clGetProgramBuildInfo(prog,dev,CL_PROGRAM_BUILD_LOG,0,NULL,&L);
+        char *log=(char*)malloc(L+1); clGetProgramBuildInfo(prog,dev,CL_PROGRAM_BUILD_LOG,L,log,NULL);
+        log[L]=0; fprintf(stderr,"Build failed:\n%s\n",log); free(log); return 1;
+    }
+
+    // Prefer batch kernel
+    cl_kernel k_batch = clCreateKernel(prog,"argon2d_batch",&err);
+    int have_batch = (err == CL_SUCCESS);
+    cl_kernel k_single = NULL;
+    if (!have_batch) {
+        k_single = clCreateKernel(prog,"argon2d_core",&err);
+        if (err != CL_SUCCESS) { fprintf(stderr,"No usable kernel found\n"); return 1; }
+        printf("Using single kernel (fallback)\n");
+    } else {
+        printf("Using batch kernel\n");
+    }
+
+    // Buffers
+    cl_mem d_prehash = clCreateBuffer(ctx, CL_MEM_READ_ONLY, 32u * BATCH, NULL, &err);
+    cl_mem d_mem     = clCreateBuffer(ctx, CL_MEM_READ_WRITE, 1024u * M_COST_KB * BATCH, NULL, &err);
+    cl_mem d_out     = clCreateBuffer(ctx, CL_MEM_READ_WRITE, 32u * BATCH, NULL, &err);
+    if (err!=CL_SUCCESS){ fprintf(stderr,"clCreateBuffer failed: %d\n", err); return 1; }
+
+    uint8_t *h_prehash = (uint8_t*)malloc(32u * BATCH);
+    uint8_t *h_out     = (uint8_t*)malloc(32u * BATCH);
+    if (!h_prehash || !h_out) { fprintf(stderr,"malloc failed\n"); return 1; }
+
+    // ===== Stratum =====
+    int PORT = getenv("POOL_PORT") ? atoi(getenv("POOL_PORT")) : PORT_DEFAULT;
+    stratum_ctx_t S;
+    if(!stratum_connect_any(&S, POOL_CANDIDATES, PORT, WAL, PASS)){
+        fprintf(stderr,"Stratum connect failed\n");
+        return 1;
+    }
+
+    uint8_t prevhash_le[32], target_block_be[32];
+    stratum_job_t J={0}, Jnew={0}; int have_job=0;
+
+    uint64_t hashes_window = 0;
+    uint64_t t_rate = mono_ms();
+    uint64_t t_poll = mono_ms();
+
+    // extranonce2 handling (masked to size)
+    static uint32_t extranonce2_counter = 1;
+    uint32_t en2_mask = (S.extranonce2_size >= 4) ? 0xFFFFFFFFu : ((1u << (S.extranonce2_size*8)) - 1u);
+
+    static uint32_t nonce_base = 0;
+    int debug_shown_for_job = 0;
+
+    while (!g_stop) {
+        // Poll stratum
+        if (mono_ms() - t_poll >= 50) {
+            char line[16384];
+            recv_into_buffer(S.sock, 0);
+            while (next_line(line,sizeof line)) {
+                double dtmp;
+                if (!g_diff_locked && parse_set_difficulty_line(line, &dtmp)) {
+                    g_share_diff = dtmp;
+                    diff_to_target(g_share_diff, g_share_target_be);
+                    if (g_debug) {
+                        printf("[DIFF] set_difficulty=%.8f\n", g_share_diff);
+                        printf("[DIFF] share_target="); for(int i=0;i<32;i++) printf("%02x", g_share_target_be[i]); printf("\n");
+                    }
+                    continue;
+                }
+                if (strstr(line,"\"mining.notify\"")) {
+                    if (stratum_parse_notify(line,&Jnew)) {
+                        J = Jnew; have_job = 1;
+                        uint8_t prev_be[32]; hex2bin(J.prevhash_hex, prev_be, 32);
+                        for (int i = 0; i < 32; i++) prevhash_le[i] = prev_be[31 - i];
+                        target_from_nbits(J.nbits, target_block_be);
+                        nonce_base = 0;
+                        extranonce2_counter = 1; // reset en2 per new job
+                        debug_shown_for_job = 0;
+                        printf("\nNew Job id %s\n", J.job_id);
+                    }
+                }
+            }
+            t_poll = mono_ms();
+        }
+        if (!have_job) { usleep(10000); continue; }
+
+        // ----- Coinbase / Merkle -----
+        uint8_t coinb1[4096], coinb2[4096];
+        size_t cb1 = strlen(J.coinb1_hex) / 2, cb2 = strlen(J.coinb2_hex) / 2;
+        hex2bin(J.coinb1_hex, coinb1, cb1);
+        hex2bin(J.coinb2_hex, coinb2, cb2);
+
+        uint8_t en1[64]; size_t en1b = strlen(S.extranonce1) / 2; if (en1b > 64) en1b = 64;
+        hex2bin(S.extranonce1, en1, en1b);
+
+        uint32_t en2_val = (extranonce2_counter++) & en2_mask; // roll within size
+        char en2_hex[64];
+        snprintf(en2_hex, sizeof en2_hex, "%0*x", S.extranonce2_size * 2, en2_val);
+        uint8_t en2[64]; hex2bin(en2_hex, en2, S.extranonce2_size);
+
+        uint8_t coinbase[8192]; size_t off = 0;
+        memcpy(coinbase + off, coinb1, cb1); off += cb1;
+        memcpy(coinbase + off, en1, en1b); off += en1b;
+        memcpy(coinbase + off, en2, S.extranonce2_size); off += S.extranonce2_size;
+        memcpy(coinbase + off, coinb2, cb2); off += cb2;
+
+        uint8_t cbh_be[32]; double_sha256(coinbase, off, cbh_be);
+
+        uint8_t merkleroot_le[32];
+        build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
+
+        // ----- Header+BLAKE3 für BATCH Nonces -----
+        uint32_t ntime_le = J.ntime;
+        for (cl_uint i=0;i<BATCH;i++) {
+            uint32_t nonce = nonce_base + i;
+            uint8_t header[80];
+            build_header_le(&J, prevhash_le, merkleroot_le, ntime_le, J.nbits, nonce, header);
+            blake3_hash32(header, 80, &h_prehash[i*32]);
+        }
+        nonce_base += BATCH;
+
+        // ----- GPU: Argon2d -----
+        err = clEnqueueWriteBuffer(q, d_prehash, CL_FALSE, 0, 32u*BATCH, h_prehash, 0, NULL, NULL);
+        if (err!=CL_SUCCESS){ fprintf(stderr,"clEnqueueWriteBuffer(prehash)=%d\n", err); return 1; }
+
+        uint32_t blocks_per_lane = M_COST_KB;
+        size_t global = (size_t)BATCH;
+
+        uint64_t t0 = mono_ms();
+
+        int used_batch = 0;
+        if (have_batch) {
+            err = set_batch_kernel_args_adaptive(k_batch, d_prehash, d_mem, d_out, BATCH, blocks_per_lane);
+            if (err == CL_SUCCESS) {
+                err = clEnqueueNDRangeKernel(q, k_batch, 1, NULL, &global, NULL, 0, NULL, NULL);
+                if (err == CL_SUCCESS) used_batch = 1;
+                else fprintf(stderr,"clEnqueueNDRangeKernel(batch)=%d\n", err);
+            } else {
+                fprintf(stderr,"clSetKernelArg(batch)=%d\n", err);
+            }
+        }
+        if (!used_batch) {
+            if (!k_single) {
+                k_single = clCreateKernel(prog,"argon2d_core",&err);
+                if (err != CL_SUCCESS) { fprintf(stderr,"Fallback kernel create failed: %d\n", err); return 1; }
+            }
+            // __kernel void argon2d_core(__global const u8* prehash32, __global u8* mem,
+            //  const u32 blocks_per_lane, const u32 pass_index, const u32 slice_index,
+            //  const u32 start_block, const u32 end_block, __global u8* out32, const u32 do_init)
+            cl_uint pass=0,slice=0,start=0,end=blocks_per_lane,do_init=1;
+            err  = clSetKernelArg(k_single, 0, sizeof(cl_mem), &d_prehash);
+            err |= clSetKernelArg(k_single, 1, sizeof(cl_mem), &d_mem);
+            err |= clSetKernelArg(k_single, 2, sizeof(cl_uint), &blocks_per_lane);
+            err |= clSetKernelArg(k_single, 3, sizeof(cl_uint), &pass);
+            err |= clSetKernelArg(k_single, 4, sizeof(cl_uint), &slice);
+            err |= clSetKernelArg(k_single, 5, sizeof(cl_uint), &start);
+            err |= clSetKernelArg(k_single, 6, sizeof(cl_uint), &end);
+            err |= clSetKernelArg(k_single, 7, sizeof(cl_mem), &d_out);
+            err |= clSetKernelArg(k_single, 8, sizeof(cl_uint), &do_init);
+            if (err!=CL_SUCCESS){ fprintf(stderr,"clSetKernelArg(single)=%d\n", err); return 1; }
+            size_t one = 1;
+            err = clEnqueueNDRangeKernel(q, k_single, 1, NULL, &one, NULL, 0, NULL, NULL);
+            if (err!=CL_SUCCESS){ fprintf(stderr,"clEnqueueNDRangeKernel(single)=%d\n", err); return 1; }
+        }
+
+        clFinish(q);
+
+        // Read results
+        err = clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32u*BATCH, h_out, 0, NULL, NULL);
+        if (err!=CL_SUCCESS){ fprintf(stderr,"clEnqueueReadBuffer(out)=%d\n", err); return 1; }
+
+        uint64_t t1 = mono_ms();
+        double batch_ms = (double)(t1 - t0);
+        hashes_window += used_batch ? BATCH : 1;
+
+        // ----- Final SHA3 + share target check + submit -----
+        uint8_t debug_final_first[32]; int debug_final_set=0;
+        cl_uint loopN = used_batch ? BATCH : 1;
+
+        // Keep the exact extranonce2 used for this batch for submits
+        char en2_hex_submit[64];
+        snprintf(en2_hex_submit, sizeof en2_hex_submit, "%0*x", S.extranonce2_size * 2, en2_val);
+
+        for (cl_uint i=0;i<loopN;i++) {
+            uint8_t final_hash[32];
+            sha3_256_once(&h_out[i*32], 32, final_hash); // SHA3-256 digest (BE)
+
+            if (!debug_final_set) { memcpy(debug_final_first, final_hash, 32); debug_final_set=1; }
+
+            if (hash_meets_target_be(final_hash, g_share_target_be)) {
+                uint32_t nonce = (nonce_base - (used_batch?BATCH:1)) + i;
+                printf("FOUND share  job=%s ntime=%08x nonce=%08x", J.job_id, J.ntime, nonce);
+                if (g_debug) printf(" ex2=%s", en2_hex_submit);
+                fflush(stdout);
+                stratum_submit(&S, &J, en2_hex_submit, J.ntime, nonce);
+            }
+        }
+
+        if (g_debug && !debug_shown_for_job) {
+            printf("[DEBUG] Job %s\n", J.job_id);
+            hexdump("prehash[0]", &h_prehash[0], 32);
+            hexdump("gpu_argon2[0]", &h_out[0], 32);
+            hexdump("final_sha3[0]", debug_final_first, 32);
+            hexdump("share_target", g_share_target_be, 32);
+            debug_shown_for_job = 1;
+        }
+
+        // Hashrate every ~5s
+        uint64_t now = mono_ms();
+        if (now - t_rate >= 5000) {
+            double secs = (now - t_rate) / 1000.0;
+            double rate = (double)hashes_window / secs;
+            printf("Hashrate: %.1f H/s | Batch: %.1fms | Job: %s\r",
+                   rate, batch_ms, J.job_id[0]?J.job_id:"-");
+            fflush(stdout);
+            t_rate = now;
+            hashes_window = 0;
+        }
+    }
+
+    // Cleanup
+    if (have_batch) clReleaseKernel(k_batch);
+    if (k_single) clReleaseKernel(k_single);
+    clReleaseProgram(prog);
+    clReleaseMemObject(d_mem);
+    clReleaseMemObject(d_prehash);
+    clReleaseMemObject(d_out);
+    clReleaseCommandQueue(q);
+    clReleaseContext(ctx);
+    free(ksrc);
+    free(h_prehash);
+    free(h_out);
+
+    return 0;
+}
 
