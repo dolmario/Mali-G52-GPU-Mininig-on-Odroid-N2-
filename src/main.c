@@ -10,6 +10,7 @@
 
 #include <openssl/evp.h>
 #include <openssl/sha.h>
+#include <openssl/bn.h>
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -68,11 +69,13 @@ static int g_diff_locked = 0;
 // Statistics
 static uint64_t g_total_hashes = 0;
 static uint32_t g_best_leading_zeros = 0;
+static uint32_t g_accepted_shares = 0;
+static uint32_t g_rejected_shares = 0;
 
-// Time rolling
+// Time rolling and job management
 static uint32_t g_batch_counter = 0;
-static uint32_t g_submit_base = 0;
-static uint64_t g_job_start_ms = 0;
+static volatile uint32_t g_job_gen = 0;
+static volatile int g_last_notify_clean = 1;
 
 // ============================ Utils ==============================
 static void blake3_hash32(const uint8_t *in, size_t len, uint8_t out[32]) {
@@ -176,7 +179,6 @@ static void diff_to_target(double diff, uint8_t out_be[32]) {
     out_be[6] = (target >> 8) & 0xFF;
     out_be[7] = target & 0xFF;
 }
-
 static int hash_meets_target_be(const uint8_t hash_be[32], const uint8_t target_be[32]) {
     for (int i = 0; i < 32; i++) {
         if (hash_be[i] < target_be[i]) return 1;
@@ -521,9 +523,13 @@ static void stratum_wait_submit_ack(int sock) {
         while (next_line(line, sizeof line)) {
             if (strstr(line, "\"id\":4")) {
                 if (strstr(line, "\"result\":true")) {
-                    printf(" -> ACCEPTED\n"); fflush(stdout); return;
+                    g_accepted_shares++;
+                    if (g_debug) printf(" -> ACCEPTED\n");
+                    fflush(stdout); return;
                 } else if (strstr(line, "\"error\"")) {
-                    printf(" -> REJECTED: %s", line); fflush(stdout); return;
+                    g_rejected_shares++;
+                    if (g_debug) printf(" -> REJECTED\n");
+                    fflush(stdout); return;
                 }
             }
             double dtmp;
@@ -556,17 +562,6 @@ static int stratum_submit(stratum_ctx_t *C,const stratum_job_t *J,
     size_t n = build_submit_json(req, sizeof req, C->wallet, J->job_id, extranonce2_hex, ntime_le, nonce_le);
     if (n == 0 || n >= sizeof req) { fprintf(stderr,"submit snprintf overflow\n"); return 0; }
     int ok = send_line_verbose(C->sock,req);
-    if (ok) stratum_wait_submit_ack(C->sock);
-    return ok;
-}
-
-// submit using explicit job_id string (nonce-bound job id)
-static int stratum_submit_with_jobid(stratum_ctx_t *C, const char *job_id,
-                                     const char *extranonce2_hex, uint32_t ntime_le, uint32_t nonce_le) {
-    char req[1536];
-    size_t n = build_submit_json(req, sizeof req, C->wallet, job_id, extranonce2_hex, ntime_le, nonce_le);
-    if (n == 0 || n >= sizeof req) { fprintf(stderr,"submit snprintf overflow\n"); return 0; }
-    int ok = send_line_verbose(C->sock, req);
     if (ok) stratum_wait_submit_ack(C->sock);
     return ok;
 }
@@ -832,13 +827,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // store job_id per nonce for the current batch
-    char *job_id_per_nonce = (char*)malloc((size_t)BATCH * 128u);
-    if (!job_id_per_nonce) {
-        fprintf(stderr, "malloc job_id_per_nonce failed\n");
-        return 1;
-    }
-
     // Stratum
     int PORT = getenv("POOL_PORT") ? atoi(getenv("POOL_PORT")) : PORT_DEFAULT;
     stratum_ctx_t S;
@@ -889,14 +877,12 @@ int main(int argc, char **argv) {
                         extranonce2_counter = 1;
                         debug_shown_for_job = 0;
 
-                        // reset rolling per job
+                        // Job generation and clean job tracking
+                        g_job_gen++;
+                        g_last_notify_clean = J.clean ? 1 : 0;
                         g_batch_counter = 0;
-                        uint32_t now = (uint32_t)time(NULL);
-                        g_submit_base = (J.ntime > now - 60 && J.ntime < now + 120) ? J.ntime : now;
-                        g_submit_base -= (g_submit_base % 16); // optional: align to 16s
-                        g_job_start_ms = mono_ms();
 
-                        printf("New Job id %s\n", J.job_id);
+                        printf("New Job id %s%s\n", J.job_id, J.clean ? " (clean)" : "");
                     }
                 }
             }
@@ -906,6 +892,9 @@ int main(int argc, char **argv) {
             usleep(10000);
             continue;
         }
+
+        // Snapshot generation for clean job detection
+        uint32_t batch_gen = g_job_gen;
 
         // Coinbase / Merkle
         uint8_t coinb1[4096], coinb2[4096];
@@ -937,22 +926,15 @@ int main(int argc, char **argv) {
         uint8_t merkleroot_le[32];
         build_merkle_root_le(cbh_be, J.merkle_hex, J.merkle_count, merkleroot_le);
 
-        // === Time rolling: header_ntime == submit_ntime ===
-        uint32_t submit_ntime = g_submit_base + (g_batch_counter % 15); // 0..14
-        uint32_t header_ntime = submit_ntime;
+        // Time rolling for submit
+        uint32_t submit_ntime = J.ntime + (g_batch_counter % 15);
 
         // Header+BLAKE3 for BATCH Nonces
-        char current_job_id[128];
-        snprintf(current_job_id, sizeof current_job_id, "%s", J.job_id);
-
         for (cl_uint i = 0; i < BATCH; i++) {
             uint32_t nonce = nonce_base + i;
             uint8_t header[80];
-            build_header_le(&J, prevhash_le, merkleroot_le, header_ntime, J.nbits, nonce, header);
+            build_header_le(&J, prevhash_le, merkleroot_le, submit_ntime, J.nbits, nonce, header);
             blake3_hash32(header, 80, &h_prehash[i * 32]);
-
-            // store job_id for this nonce (freeze against later job switches)
-            snprintf(&job_id_per_nonce[i * 128], 128, "%s", current_job_id);
         }
         nonce_base += BATCH;
 
@@ -969,7 +951,6 @@ int main(int argc, char **argv) {
         uint64_t t0 = mono_ms();
 
         int used_batch = 0;
-        cl_kernel k_exec = NULL;
         if (have_batch) {
             if (set_batch_kernel_args_adaptive(k_batch, d_prehash, d_mem, d_out, BATCH, blocks_per_lane) == CL_SUCCESS &&
                 clEnqueueNDRangeKernel(q, k_batch, 1, NULL, &global, NULL, 0, NULL, NULL) == CL_SUCCESS) {
@@ -1003,9 +984,6 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "clEnqueueNDRangeKernel(single) failed\n");
                 return 1;
             }
-            k_exec = k_single;
-        } else {
-            k_exec = k_batch;
         }
 
         clFinish(q);
@@ -1020,6 +998,12 @@ int main(int argc, char **argv) {
         double batch_ms = (double)(t1 - t0);
         hashes_window += used_batch ? BATCH : 1;
 
+        // Clean job check: if clean job came during batch processing, discard shares
+        if (g_last_notify_clean && g_job_gen != batch_gen) {
+            // Don't submit stale shares from before clean job
+            goto after_submit;
+        }
+
         // Final SHA3 + share target check + submit
         cl_uint loopN = used_batch ? BATCH : 1;
 
@@ -1033,14 +1017,16 @@ int main(int argc, char **argv) {
 
             if (hash_meets_target_be(final_hash, g_share_target_be)) {
                 uint32_t nonce = (nonce_base - (used_batch ? BATCH : 1)) + i;
-                const char *jid = &job_id_per_nonce[i * 128];
-                printf("\nSHARE FOUND! job=%s nonce=%08x ntime=%08x (+%u)",
-                       jid, nonce, submit_ntime, submit_ntime - header_ntime);
-                fflush(stdout);
-                stratum_submit_with_jobid(&S, jid, en2_hex_submit, submit_ntime, nonce);
+                // Only show shares in debug mode or first few
+                if (g_debug || g_accepted_shares + g_rejected_shares < 5) {
+                    printf("\nSHARE FOUND! job=%s nonce=%08x", J.job_id, nonce);
+                    fflush(stdout);
+                }
+                stratum_submit(&S, &J, en2_hex_submit, submit_ntime, nonce);
             }
         }
 
+        after_submit:
         // Increment batch counter for time rolling
         g_batch_counter++;
 
@@ -1055,8 +1041,8 @@ int main(int argc, char **argv) {
         if (now - t_rate >= 5000) {
             double secs = (now - t_rate) / 1000.0;
             double rate = (double)hashes_window / secs;
-            printf("Hashrate: %.1f H/s | Batch: %.1fms | Job: %s | Best: %u zeros\r",
-                   rate, batch_ms, J.job_id[0] ? J.job_id : "-", g_best_leading_zeros);
+            printf("Hashrate: %.1f H/s | Batch: %.1fms | Job: %s | Shares: %u/%u\r",
+                   rate, batch_ms, J.job_id[0] ? J.job_id : "-", g_accepted_shares, g_rejected_shares);
             fflush(stdout);
             t_rate = now;
             hashes_window = 0;
@@ -1075,7 +1061,6 @@ int main(int argc, char **argv) {
     free(ksrc);
     free(h_prehash);
     free(h_out);
-    free(job_id_per_nonce);
 
     return 0;
 }
