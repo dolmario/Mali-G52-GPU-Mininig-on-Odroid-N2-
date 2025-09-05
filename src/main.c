@@ -1,4 +1,4 @@
-// src/main.c – RinHash Batch-GPU Miner (Odroid N2+ / Mali-G52 Panfrost)
+// src/main.c — RinHash Batch-GPU Miner (Odroid N2+ / Mali-G52 Panfrost)
 // Pipeline: BLAKE3(80B header LE) -> Argon2d (GPU) -> SHA3-256 (CPU) -> compare vs share target (BE) -> submit
 // Stratum: Zergpool RinHash (subscribe/authorize/notify/set_difficulty/submit)
 
@@ -51,27 +51,26 @@ static const char *DEFAULT_PASS = "c=DOGE,ID=n2plus";
 #define T_COST    2
 #define LANES     1
 
-// Batch defaults
+// Batch default
 #define BATCH_DEFAULT 256
-#define CHUNK_DEFAULT 64  // nonces per micro-batch launch (tunable with RIN_CHUNK)
 
 // ============================ Globals / Debug =============================
-static int g_debug = 0;
 
-// Share difficulty & target (BE)
-static double  g_share_diff = 1.0;
-// DIFF1 target (Bitcoin-style) in big-endian:
 static const uint8_t DIFF1_TARGET_BE[32] = {
     0x00,0x00,0x00,0x00, 0xFF,0xFF,0x00,0x00,
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
 };
+
+static int g_debug = 0;
+
+// Share difficulty & target (BE)
+static double  g_share_diff = 1.0;
 static uint8_t g_share_target_be[32] = {
     0x00,0x00,0x00,0x00, 0xFF,0xFF,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0
 };
 static int g_diff_locked = 0;
 
@@ -160,81 +159,53 @@ static void update_statistics(const uint8_t hash_be[32]) {
 }
 
 // ============================ Difficulty calculation =============================
-// Helper: Serialize BN to exactly 32 BE bytes (pads with zeros)
-static void bn_to_be32(const BIGNUM *bn, uint8_t out_be[32]) {
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
-    // BN_bn2binpad is available on OpenSSL >= 1.1.0
-    (void)BN_bn2binpad(bn, out_be, 32);
-#else
-    memset(out_be, 0, 32);
-    int n = BN_num_bytes(bn);
-    if (n <= 0) return;
-    if (n > 32) {
-        // Shouldn't happen since we clamp to 2^256-1, but guard anyway: take low 32 bytes.
-        uint8_t tmp[64];
-        int m = BN_bn2bin(bn, tmp);
-        memcpy(out_be, tmp + (m - 32), 32);
-    } else {
-        BN_bn2bin(bn, out_be + (32 - n));
-    }
-#endif
-}
-
 static void diff_to_target(double diff, uint8_t out_be[32]) {
-    // DIFF1 / diff  (full 256-bit precision). If diff <= 0 -> set to max.
-    if (diff <= 0.0 || isnan(diff)) {
-        memset(out_be, 0xFF, 32);
-        return;
-    }
+    if (diff <= 0) diff = 1e-12;
 
     BN_CTX *ctx = BN_CTX_new();
-    BIGNUM *bn_diff1 = BN_bin2bn(DIFF1_TARGET_BE, 32, NULL);
-    BIGNUM *bn_scale = BN_new();
-    BIGNUM *bn_num   = BN_new();
-    BIGNUM *bn_den   = BN_new();
-    BIGNUM *bn_out   = BN_new();
+    BIGNUM *diff1 = BN_bin2bn(DIFF1_TARGET_BE, 32, NULL);
+    BIGNUM *num   = BN_new();
+    BIGNUM *den   = BN_new();
+    BIGNUM *tgt   = BN_new();
 
-    // scale = 10^12  (enough to make double->int stable; cancels out in division)
-    BN_dec2bn(&bn_scale, "1000000000000");
+    // Fixed-Point: *2^24, damit kleine diff-Werte exakt bleiben
+    const unsigned SHIFT = 24;
+    BN_copy(num, diff1);
+    BN_lshift(num, num, SHIFT);  // diff1 * 2^24
 
-    // num = DIFF1 * scale
-    BN_mul(bn_num, bn_diff1, bn_scale, ctx);
+    long double scaled = (long double)diff * (long double)(1ULL << SHIFT);
+    uint64_t den64 = (scaled < 1.0L) ? 1ULL : (uint64_t)llroundl(scaled);
+    BN_set_word(den, den64);
 
-    // den = round(diff * scale); clamp to at least 1
-    long double scaled = floorl((long double)diff * 1000000000000.0L + 0.5L);
-    if (scaled < 1.0L) scaled = 1.0L;
-    char den_str[64];
-    // no decimals
-    snprintf(den_str, sizeof den_str, "%.0Lf", scaled);
-    BN_dec2bn(&bn_den, den_str);
+    BN_div(tgt, NULL, num, den, ctx);  // floor(diff1*2^24 / (diff*2^24))
 
-    // out = floor(num / den)
-    BN_div(bn_out, NULL, bn_num, bn_den, ctx);
+    if (BN_is_zero(tgt)) BN_one(tgt);
 
-    // Clamp to 2^256-1 just in case
-    BIGNUM *one = BN_new(), *max256 = BN_new();
-    BN_one(one);
-    BN_lshift(max256, one, 256);
-    BN_sub_word(max256, 1);
-    if (BN_cmp(bn_out, max256) > 0) {
-        BN_copy(bn_out, max256);
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    BN_bn2binpad(tgt, out_be, 32);     // exakt 32-Byte big-endian
+#else
+    memset(out_be, 0, 32);
+    int n = BN_num_bytes(tgt);
+    if (n > 32) {
+        uint8_t tmp[64]; int m = BN_bn2bin(tgt, tmp);
+        memcpy(out_be, tmp + (m - 32), 32);
+    } else {
+        BN_bn2bin(tgt, out_be + (32 - n));
     }
+#endif
 
-    bn_to_be32(bn_out, out_be);
-
-    BN_free(max256); BN_free(one);
-    BN_free(bn_out); BN_free(bn_den); BN_free(bn_num);
-    BN_free(bn_scale); BN_free(bn_diff1);
-    BN_CTX_free(ctx);
+    BN_free(diff1); BN_free(num); BN_free(den); BN_free(tgt); BN_CTX_free(ctx);
 }
 
+// 256-Bit Vergleich: Hash (BE) <= Target (BE) ?
 static int hash_meets_target_be(const uint8_t hash_be[32], const uint8_t target_be[32]) {
     for (int i = 0; i < 32; i++) {
-        if (hash_be[i] < target_be[i]) return 1;
-        if (hash_be[i] > target_be[i]) return 0;
+        if (hash_be[i] < target_be[i]) return 1; // Hash kleiner -> erfüllt Target
+        if (hash_be[i] > target_be[i]) return 0; // Hash größer  -> nicht erfüllt
     }
-    return 1;
+    return 1; // exakt gleich
 }
+
 
 // ============================ Stratum ==============================
 typedef struct {
@@ -398,15 +369,27 @@ static const char* find_after_result_array_first(const char *s) {
 }
 
 static int parse_subscribe_result(const char *line, char *ex1, size_t ex1cap, cl_uint *ex2sz){
-    const char *after_first = find_after_result_array_first(line);
-    if (!after_first) return 0;
-    const char *q1 = strchr(after_first, '"'); if(!q1) return 0;
-    const char *q2 = strchr(q1+1, '"');       if(!q2) return 0;
-    size_t L = (size_t)(q2 - (q1+1)); if (L >= ex1cap) L = ex1cap-1;
-    memcpy(ex1, q1+1, L); ex1[L] = 0;
-
-    const char *p = q2+1;
-    while (*p && (*p==' ' || *p==',' || *p==']')) p++;
+    if (!strstr(line, "\"id\":1") || !strstr(line, "\"result\"")) return 0;
+    const char *p = strstr(line, "\"result\""); if(!p) return 0;
+    p = strchr(p, '['); if (!p) return 0; p++;
+    if (*p != '[') return 0;
+    int depth = 0;
+    while (*p) {
+        if (*p == '[') depth++;
+        else if (*p == ']') { depth--; if (depth == 0) { p++; break; } }
+        p++;
+    }
+    if (depth != 0) return 0;
+    while (*p == ' ' || *p == '	' || *p == ',') p++;
+    if (*p != '"') return 0;
+    const char *q1 = ++p;
+    while (*p && *p != '"') p++;
+    if (*p != '"') return 0;
+    size_t L = (size_t)(p - q1); if (L >= ex1cap) L = ex1cap - 1;
+    memcpy(ex1, q1, L); ex1[L] = 0;
+    p++;
+    while (*p == ' ' || *p == '	' || *p == ',') p++;
+    if (!(*p == '-' || (*p >= '0' && *p <= '9'))) return 0;
     unsigned long v = strtoul(p, NULL, 10);
     if (v == 0 || v > 32) v = 4;
     *ex2sz = (cl_uint)v;
@@ -564,53 +547,70 @@ static int stratum_parse_notify(const char *line, stratum_job_t *J){
     return 1;
 }
 
+// Stratum will 8-stellige Hex-ZAHLEN für ntime/nonce (wie cpuminer), nicht LE-Byte-Hex.
+static size_t build_submit_json(char *req, size_t cap,
+                                const char *wallet, const char *job_id,
+                                const char *ex2_hex, uint32_t ntime_le, uint32_t nonce_le)
+{
+    return (size_t)snprintf(
+        req, cap,
+        "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%08x\",\"%08x\"]}\n",
+        wallet, job_id, ex2_hex, (unsigned)ntime_le, (unsigned)nonce_le
+    );
+}
+
+// Immer die Pool-Antwort zeigen, inkl. REJECT-Grund (JSON)
 static void stratum_wait_submit_ack(int sock) {
     char line[4096];
     uint64_t start = mono_ms();
-    while (mono_ms() - start <= 3000) {
-        recv_into_buffer(sock, 0);
+
+    while (mono_ms() - start <= 5000) {
+        recv_into_buffer(sock, 250);
+
         while (next_line(line, sizeof line)) {
             if (strstr(line, "\"id\":4")) {
                 if (strstr(line, "\"result\":true")) {
                     g_accepted_shares++;
-                    if (g_debug) printf(" -> ACCEPTED\n");
-                    fflush(stdout); return;
-                } else if (strstr(line, "\"error\"")) {
+                    fprintf(stderr, " -> ACCEPTED\n");
+                    fflush(stdout);
+                    return;
+                }
+                if (strstr(line, "\"error\"")) {
                     g_rejected_shares++;
-                    if (g_debug) printf(" -> REJECTED\n");
-                    fflush(stdout); return;
+                    fprintf(stderr, "[REJECT] %s", line);
+                    fprintf(stderr, " -> REJECTED\n");
+                    fflush(stdout);
+                    return;
                 }
             }
+            // nebenbei reinkommende diff ggf. übernehmen
             double dtmp;
             if (!g_diff_locked && parse_set_difficulty_line(line, &dtmp)) {
                 g_share_diff = dtmp;
                 diff_to_target(g_share_diff, g_share_target_be);
-                if (g_debug) {
-                    printf("[DIFF] set_difficulty=%.8f\n", g_share_diff);
-                }
+                if (g_debug) fprintf(stderr, "[DIFF] set_difficulty=%.8f\n", g_share_diff);
             }
         }
         usleep(20000);
     }
+    fprintf(stderr, "[WARN] submit ack timeout (>5s)\n");
 }
 
-static size_t build_submit_json(char *req, size_t cap,
-                                const char *wallet, const char *job_id,
-                                const char *ex2_hex, uint32_t ntime_le, uint32_t nonce_le) {
-    char ntime_hex[9], nonce_hex[9];
-    snprintf(ntime_hex, sizeof ntime_hex, "%08x", ntime_le);
-    snprintf(nonce_hex, sizeof nonce_hex, "%08x", nonce_le);
-    return (size_t)snprintf(req, cap,
-        "{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}\n",
-        wallet, job_id, ex2_hex, ntime_hex, nonce_hex);
-}
-
-static int stratum_submit(stratum_ctx_t *C,const stratum_job_t *J,
-                          const char *extranonce2_hex,uint32_t ntime_le,uint32_t nonce_le){
+static int stratum_submit(stratum_ctx_t *C, const stratum_job_t *J,
+                          const char *extranonce2_hex, uint32_t ntime_le, uint32_t nonce_le)
+{
+    if (g_debug) {
+        fprintf(stderr, "SUBMIT job=%s ex2=%s ntime=%08x nonce=%08x\n",
+                J->job_id, extranonce2_hex, (unsigned)ntime_le, (unsigned)nonce_le);
+    }
     char req[1536];
-    size_t n = build_submit_json(req, sizeof req, C->wallet, J->job_id, extranonce2_hex, ntime_le, nonce_le);
-    if (n == 0 || n >= sizeof req) { fprintf(stderr,"submit snprintf overflow\n"); return 0; }
-    int ok = send_line_verbose(C->sock,req);
+    size_t n = build_submit_json(req, sizeof req, C->wallet, J->job_id,
+                                 extranonce2_hex, ntime_le, nonce_le);
+    if (n == 0 || n >= sizeof req) {
+        fprintf(stderr,"submit snprintf overflow\n");
+        return 0;
+    }
+    int ok = send_line_verbose(C->sock, req);
     if (ok) stratum_wait_submit_ack(C->sock);
     return ok;
 }
@@ -724,27 +724,28 @@ int main(int argc, char **argv) {
 
     if (getenv("RIN_DEBUG")) g_debug = atoi(getenv("RIN_DEBUG"));
 
-    cl_uint BATCH = BATCH_DEFAULT;
+        cl_uint BATCH = BATCH_DEFAULT;
     if (getenv("RIN_BATCH")) {
         int b = atoi(getenv("RIN_BATCH"));
         if (b > 0 && b <= 4096) BATCH = (cl_uint)b;
     }
 
-    cl_uint CHUNK = CHUNK_DEFAULT;
+    // --- NEW: chunk (Microbatch) ---
+    cl_uint chunk = 64;
     if (getenv("RIN_CHUNK")) {
         int c = atoi(getenv("RIN_CHUNK"));
-        if (c > 0 && c <= (int)BATCH) CHUNK = (cl_uint)c;
+        if (c > 0) chunk = (cl_uint)c;
     }
-    if (CHUNK > BATCH) CHUNK = BATCH;
+    if (chunk > BATCH) chunk = BATCH;
+    if (chunk < 1)     chunk = 1;
 
     const char *wallet_env = getenv("WALLET");
     const char *pass_env   = getenv("POOL_PASS");
     const char *WAL  = wallet_env && wallet_env[0] ? wallet_env : DEFAULT_WAL;
     const char *PASS = pass_env   && pass_env[0]   ? pass_env   : DEFAULT_PASS;
 
-    // Parse d= or sd= from POOL_PASS
-    double pdiff = 0.0;
-    int locked = 0;
+    // Parse d= / sd= aus POOL_PASS (Diff & Lock setzen)
+    double pdiff = 0.0; int locked = 0;
     if (parse_diff_from_pass(PASS, &pdiff, &locked) && pdiff > 0.0) {
         g_share_diff = pdiff;
         diff_to_target(g_share_diff, g_share_target_be);
@@ -752,7 +753,6 @@ int main(int argc, char **argv) {
         printf("Password diff: %.8f%s\n", g_share_diff, locked ? " (locked)" : " (start)");
     }
 
-    // Optional forced share diff (locks)
     const char *force_d_env = getenv("RIN_FORCE_DIFF");
     if (force_d_env && force_d_env[0]) {
         g_share_diff = atof(force_d_env);
@@ -763,8 +763,9 @@ int main(int argc, char **argv) {
     }
 
     printf("=== RinHash Batch-GPU Miner ===\n");
-    printf("Batch size: %u  (chunk=%u)\n", (unsigned)BATCH, (unsigned)CHUNK);
+    printf("Batch size: %u  (chunk=%u)\n", BATCH, chunk);
     printf("Wallet: %s\n", WAL);
+
 
     // OpenCL Setup
     cl_int err; cl_platform_id plat; cl_device_id dev;
@@ -795,8 +796,7 @@ int main(int argc, char **argv) {
                needed / 1024 / 1024, (unsigned long)(max_alloc / 1024 / 1024));
         BATCH = (cl_uint)(max_alloc / (32 + 1024 * M_COST_KB + 32));
         if (BATCH < 32) BATCH = 32;
-        if (CHUNK > BATCH) CHUNK = BATCH;
-        printf("Auto-reducing batch to %u (chunk=%u)\n", (unsigned)BATCH, (unsigned)CHUNK);
+        printf("Auto-reducing batch to %u\n", BATCH);
         needed = (size_t)BATCH * (32 + 1024 * M_COST_KB + 32);
     }
 
@@ -858,7 +858,7 @@ int main(int argc, char **argv) {
         printf("Using batch kernel\n");
     }
 
-    // Create aligned buffers (capacity = BATCH, but we can launch CHUNK<=BATCH)
+    // Create aligned buffers
     cl_mem d_prehash = create_aligned_buffer(ctx, CL_MEM_READ_ONLY, 32u * BATCH, &err);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "prehash buffer failed: %d\n", err);
@@ -950,87 +950,108 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        // Snapshot generation for clean job detection
+        // Snapshot for clean detection
         uint32_t batch_gen = g_job_gen;
+        uint32_t clean_at_start = g_last_notify_clean;
 
-        // Coinbase / Merkle and micro-batch loop (CHUNK nonces per launch)
-        // Snapshot the job for THIS chunk to avoid "invalid job id" on non-clean notifies
-        stratum_job_t batch_job;
-        memcpy(&batch_job, &J, sizeof(stratum_job_t));
+        // Coinbase / Merkle
+        stratum_job_t batch_job = J;  // SNAPSHOT
 
-        // Build coinbase with fresh extranonce2 for this chunk
         uint8_t coinb1[4096], coinb2[4096];
-        size_t cb1 = strlen(batch_job.coinb1_hex) / 2, cb2 = strlen(batch_job.coinb2_hex) / 2;
+        size_t cb1 = strlen(batch_job.coinb1_hex) / 2;
+        size_t cb2 = strlen(batch_job.coinb2_hex) / 2;
         hex2bin(batch_job.coinb1_hex, coinb1, cb1);
         hex2bin(batch_job.coinb2_hex, coinb2, cb2);
 
-        uint8_t en1[64];
-        size_t en1b = strlen(S.extranonce1) / 2;
+        uint8_t en1[64]; size_t en1b = strlen(S.extranonce1) / 2;
         if (en1b > 64) en1b = 64;
         hex2bin(S.extranonce1, en1, en1b);
 
-        uint32_t en2_val = (extranonce2_counter++) & en2_mask;
-        char en2_hex[64];
-        snprintf(en2_hex, sizeof en2_hex, "%0*x", S.extranonce2_size * 2, en2_val);
-        uint8_t en2[64];
-        hex2bin(en2_hex, en2, S.extranonce2_size);
+        // fresh extranonce2 (mask auf ex2_size)
+        uint32_t en2_mask = (S.extranonce2_size >= 4) ? 0xFFFFFFFFu : ((1u << (S.extranonce2_size * 8)) - 1u);
+        
+        // fresh extranonce2 - NUR beim ersten Chunk eines Jobs
+        static uint32_t current_en2_for_job = 0;
+        if (g_batch_counter == 0) {
+            current_en2_for_job = (extranonce2_counter++) & en2_mask;
+        }
+        uint32_t en2_val = current_en2_for_job;
 
-        uint8_t coinbase[8192];
-        size_t off = 0;
+        // ---- WICHTIG: en2 BYTES -> coinbase ---- (LE Zählweise wie bisher)
+        uint8_t en2[64] = {0};
+        for (int i = 0; i < (int)S.extranonce2_size && i < 4; i++)
+            en2[i] = (uint8_t)((en2_val >> (8 * i)) & 0xFF);
+
+        // en2_hex GENAU aus diesen Bytes (gleiche Reihenfolge wie in coinbase!)
+        char en2_hex[64] = {0};
+        for (cl_uint i = 0; i < S.extranonce2_size; i++) {
+            snprintf(en2_hex + i*2, sizeof en2_hex - i*2, "%02x", en2[i]);
+        }
+
+        // coinbase = coinb1 | en1 | en2 | coinb2
+        uint8_t coinbase[8192]; size_t off = 0;
         memcpy(coinbase + off, coinb1, cb1); off += cb1;
-        memcpy(coinbase + off, en1, en1b);   off += en1b;
-        memcpy(coinbase + off, en2, S.extranonce2_size); off += S.extranonce2_size;
+        memcpy(coinbase + off, en1,    en1b); off += en1b;
+        memcpy(coinbase + off, en2,    S.extranonce2_size); off += S.extranonce2_size;
         memcpy(coinbase + off, coinb2, cb2); off += cb2;
 
-        uint8_t cbh_be[32];
-        double_sha256(coinbase, off, cbh_be);
+        // double-SHA256(coinbase) -> BE
+        uint8_t cbh_be[32]; double_sha256(coinbase, off, cbh_be);
 
+        // Merkle-Root (LE) für Header
         uint8_t merkleroot_le[32];
         build_merkle_root_le(cbh_be, batch_job.merkle_hex, batch_job.merkle_count, merkleroot_le);
 
-        // Time rolling for submit (per micro-batch)
+        // Time rolling aus SNAPSHOT
         uint32_t submit_ntime = batch_job.ntime + (g_batch_counter % 15);
 
-        // Decide how many nonces to run this launch
-        cl_uint workN = CHUNK;
-
-        // Header+BLAKE3 for workN Nonces
+        // -------- Prehash (BLAKE3) nur für workN = chunk --------
+        cl_uint workN = chunk;
+        if (!have_batch) workN = 1;
         for (cl_uint i = 0; i < workN; i++) {
             uint32_t nonce = nonce_base + i;
             uint8_t header[80];
-            build_header_le(&batch_job, prevhash_le, merkleroot_le, submit_ntime, batch_job.nbits, nonce, header);
+            build_header_le(&batch_job, prevhash_le, merkleroot_le,
+                            submit_ntime, batch_job.nbits, nonce, header);
             blake3_hash32(header, 80, &h_prehash[i * 32]);
         }
         nonce_base += workN;
 
-        // GPU: Argon2d
+        // -------- GPU Launch: nur workN Bytes schieben/lesen --------
         err = clEnqueueWriteBuffer(q, d_prehash, CL_FALSE, 0, 32u * workN, h_prehash, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "clEnqueueWriteBuffer(prehash)=%d\n", err);
-            return 1;
-        }
+        if (err != CL_SUCCESS) { fprintf(stderr, "clEnqueueWriteBuffer(prehash)=%d\n", err); return 1; }
 
         uint32_t blocks_per_lane = M_COST_KB;
         size_t global = (size_t)workN;
 
         uint64_t t0 = mono_ms();
 
-        int used_batch = 0;
         if (have_batch) {
-            if (set_batch_kernel_args_adaptive(k_batch, d_prehash, d_mem, d_out, workN, blocks_per_lane) == CL_SUCCESS &&
-                clEnqueueNDRangeKernel(q, k_batch, 1, NULL, &global, NULL, 0, NULL, NULL) == CL_SUCCESS) {
-                used_batch = 1;
-            }
-        }
-        if (!used_batch) {
-            if (!k_single) {
-                k_single = clCreateKernel(prog, "argon2d_core", &err);
-                if (err != CL_SUCCESS) {
-                    fprintf(stderr, "Fallback kernel create failed: %d\n", err);
+            if (!(set_batch_kernel_args_adaptive(k_batch, d_prehash, d_mem, d_out, workN, blocks_per_lane) == CL_SUCCESS &&
+                  clEnqueueNDRangeKernel(q, k_batch, 1, NULL, &global, NULL, 0, NULL, NULL) == CL_SUCCESS)) {
+                fprintf(stderr, "clEnqueueNDRangeKernel(batch) failed, trying single...\n");
+                // Fallback Single
+                if (!k_single) { k_single = clCreateKernel(prog, "argon2d_core", &err);
+                    if (err != CL_SUCCESS) { fprintf(stderr, "Fallback kernel create failed: %d\n", err); return 1; } }
+                cl_uint pass=0,slice=0,start=0,end=blocks_per_lane,do_init=1;
+                err  = clSetKernelArg(k_single, 0, sizeof(cl_mem), &d_prehash);
+                err |= clSetKernelArg(k_single, 1, sizeof(cl_mem), &d_mem);
+                err |= clSetKernelArg(k_single, 2, sizeof(cl_uint), &blocks_per_lane);
+                err |= clSetKernelArg(k_single, 3, sizeof(cl_uint), &pass);
+                err |= clSetKernelArg(k_single, 4, sizeof(cl_uint), &slice);
+                err |= clSetKernelArg(k_single, 5, sizeof(cl_uint), &start);
+                err |= clSetKernelArg(k_single, 6, sizeof(cl_uint), &end);
+                err |= clSetKernelArg(k_single, 7, sizeof(cl_mem), &d_out);
+                err |= clSetKernelArg(k_single, 8, sizeof(cl_uint), &do_init);
+                if (err != CL_SUCCESS || clEnqueueNDRangeKernel(q, k_single, 1, NULL, &(size_t){1}, NULL, 0, NULL, NULL) != CL_SUCCESS) {
+                    fprintf(stderr, "clEnqueueNDRangeKernel(single) failed\n");
                     return 1;
                 }
             }
-            cl_uint pass = 0, slice = 0, start = 0, end = blocks_per_lane, do_init = 1;
+        } else {
+            if (!k_single) { k_single = clCreateKernel(prog, "argon2d_core", &err);
+                if (err != CL_SUCCESS) { fprintf(stderr, "No usable kernel found\n"); return 1; } }
+            cl_uint pass=0,slice=0,start=0,end=blocks_per_lane,do_init=1;
             err  = clSetKernelArg(k_single, 0, sizeof(cl_mem), &d_prehash);
             err |= clSetKernelArg(k_single, 1, sizeof(cl_mem), &d_mem);
             err |= clSetKernelArg(k_single, 2, sizeof(cl_uint), &blocks_per_lane);
@@ -1040,12 +1061,7 @@ int main(int argc, char **argv) {
             err |= clSetKernelArg(k_single, 6, sizeof(cl_uint), &end);
             err |= clSetKernelArg(k_single, 7, sizeof(cl_mem), &d_out);
             err |= clSetKernelArg(k_single, 8, sizeof(cl_uint), &do_init);
-            if (err != CL_SUCCESS) {
-                fprintf(stderr, "clSetKernelArg(single)=%d\n", err);
-                return 1;
-            }
-            size_t one = 1;
-            if (clEnqueueNDRangeKernel(q, k_single, 1, NULL, &one, NULL, 0, NULL, NULL) != CL_SUCCESS) {
+            if (err != CL_SUCCESS || clEnqueueNDRangeKernel(q, k_single, 1, NULL, &(size_t){1}, NULL, 0, NULL, NULL) != CL_SUCCESS) {
                 fprintf(stderr, "clEnqueueNDRangeKernel(single) failed\n");
                 return 1;
             }
@@ -1054,26 +1070,20 @@ int main(int argc, char **argv) {
         clFinish(q);
 
         err = clEnqueueReadBuffer(q, d_out, CL_TRUE, 0, 32u * workN, h_out, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "clEnqueueReadBuffer(out)=%d\n", err);
-            return 1;
-        }
+        if (err != CL_SUCCESS) { fprintf(stderr, "clEnqueueReadBuffer(out)=%d\n", err); return 1; }
 
         uint64_t t1 = mono_ms();
         double batch_ms = (double)(t1 - t0);
-        hashes_window += used_batch ? workN : 1;
+        hashes_window += workN;
 
-        // If a CLEAN notify arrived since we took the snapshot, drop this chunk's shares
-        // (Correct per Stratum: clean_jobs invalidates all prior work immediately.)
-        if (g_last_notify_clean && g_job_gen != batch_gen) {
-            goto after_submit; // discard results for the old job
+        // Clean: NUR verwerfen, wenn während des Launches clean kam
+        if (!clean_at_start && g_last_notify_clean && g_job_gen != batch_gen) {
+            goto after_submit;
         }
 
-        // Final SHA3 + share target check + submit (use the SNAPSHOT job & extranonce2!)
-        char en2_hex_submit[64];
-        snprintf(en2_hex_submit, sizeof en2_hex_submit, "%0*x", S.extranonce2_size * 2, en2_val);
-
-        for (cl_uint i = 0; i < workN; i++) {
+        // Final SHA3 + Target + Submit
+        cl_uint loopN = workN;
+        for (cl_uint i = 0; i < loopN; i++) {
             uint8_t final_hash[32];
             sha3_256_once(&h_out[i * 32], 32, final_hash);
             update_statistics(final_hash);
@@ -1081,20 +1091,21 @@ int main(int argc, char **argv) {
             if (hash_meets_target_be(final_hash, g_share_target_be)) {
                 uint32_t nonce = (nonce_base - workN) + i;
                 if (g_debug || g_accepted_shares + g_rejected_shares < 5) {
-                    printf("\nSHARE FOUND! job=%s nonce=%08x", batch_job.job_id, nonce);
+                    printf("\nSHARE FOUND! job=%s nonce=%08x", J.job_id, nonce);
                     fflush(stdout);
                 }
-                stratum_submit(&S, &batch_job, en2_hex_submit, submit_ntime, nonce);
+                // exakt derselbe Snapshot + derselbe en2_hex + %08x-ntime/nonce
+                stratum_submit(&S, &batch_job, en2_hex, submit_ntime, nonce);
             }
         }
 
-        after_submit:
-        // Increment batch counter for time rolling
+after_submit:
         g_batch_counter++;
 
+
         if (g_debug && !debug_shown_for_job) {
-            printf("Debug: job=%s best=%u zeros diff=%.6f chunk=%u\n",
-                   J.job_id, g_best_leading_zeros, g_share_diff, (unsigned)CHUNK);
+            printf("Debug: job=%s best=%u zeros diff=%.6f batch=%u\n",
+                   J.job_id, g_best_leading_zeros, g_share_diff, g_batch_counter);
             debug_shown_for_job = 1;
         }
 
@@ -1103,7 +1114,7 @@ int main(int argc, char **argv) {
         if (now - t_rate >= 5000) {
             double secs = (now - t_rate) / 1000.0;
             double rate = (double)hashes_window / secs;
-            printf("Hashrate: %.1f H/s | Chunk: %.1fms | Job: %s | Shares: %u/%u\r",
+            printf("Hashrate: %.1f H/s | Batch: %.1fms | Job: %s | Shares: %u/%u\r",
                    rate, batch_ms, J.job_id[0] ? J.job_id : "-", g_accepted_shares, g_rejected_shares);
             fflush(stdout);
             t_rate = now;
