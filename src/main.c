@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
@@ -57,6 +58,7 @@ static const char *DEFAULT_PASS = "c=DOGE,ID=n2plus";
 // ============================ Globals / Debug =============================
 
 static const uint8_t DIFF1_TARGET_BE[32] = {
+    // Bitcoin diff1 as BIG-ENDIAN: 0x00000000ffff0000...
     0x00,0x00,0x00,0x00, 0xFF,0xFF,0x00,0x00,
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
@@ -131,34 +133,27 @@ static uint64_t mono_ms(void){
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec*1000ull + (uint64_t)ts.tv_nsec/1000000ull;
 }
-
 // ============================ Debug Functions =============================
 static void update_statistics(const uint8_t hash_be[32]) {
     g_total_hashes++;
-    
     uint32_t zeros = 0;
     for (int i = 0; i < 32; i++) {
-        if (hash_be[i] == 0) {
-            zeros += 8;
-        } else {
+        if (hash_be[i] == 0) zeros += 8;
+        else {
             uint8_t b = hash_be[i];
-            while ((b & 0x80) == 0 && zeros < 256) {
-                zeros++;
-                b <<= 1;
-            }
+            while ((b & 0x80) == 0 && zeros < 256) { zeros++; b <<= 1; }
             break;
         }
     }
-    
     if (zeros > g_best_leading_zeros) {
         g_best_leading_zeros = zeros;
-        if (g_debug) {
-            printf("New best: %u leading zero bits\n", zeros);
-        }
+        if (g_debug) printf("New best: %u leading zero bits\n", zeros);
     }
 }
 
-// ============================ Difficulty calculation =============================
+// ============================ Difficulty / Target utils =============================
+
+// diff -> 256-bit Target (big-endian)
 static void diff_to_target(double diff, uint8_t out_be[32]) {
     if (diff <= 0) diff = 1e-12;
 
@@ -168,21 +163,20 @@ static void diff_to_target(double diff, uint8_t out_be[32]) {
     BIGNUM *den   = BN_new();
     BIGNUM *tgt   = BN_new();
 
-    // Fixed-Point: *2^24, damit kleine diff-Werte exakt bleiben
+    // Fixed-Point für Genauigkeit
     const unsigned SHIFT = 24;
     BN_copy(num, diff1);
-    BN_lshift(num, num, SHIFT);  // diff1 * 2^24
+    BN_lshift(num, num, SHIFT);
 
     long double scaled = (long double)diff * (long double)(1ULL << SHIFT);
     uint64_t den64 = (scaled < 1.0L) ? 1ULL : (uint64_t)llroundl(scaled);
     BN_set_word(den, den64);
 
-    BN_div(tgt, NULL, num, den, ctx);  // floor(diff1*2^24 / (diff*2^24))
-
+    BN_div(tgt, NULL, num, den, ctx);
     if (BN_is_zero(tgt)) BN_one(tgt);
 
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L
-    BN_bn2binpad(tgt, out_be, 32);     // exakt 32-Byte big-endian
+    BN_bn2binpad(tgt, out_be, 32);
 #else
     memset(out_be, 0, 32);
     int n = BN_num_bytes(tgt);
@@ -197,26 +191,54 @@ static void diff_to_target(double diff, uint8_t out_be[32]) {
     BN_free(diff1); BN_free(num); BN_free(den); BN_free(tgt); BN_CTX_free(ctx);
 }
 
-// 256-Bit Vergleich: Hash (BE) <= Target (BE) ?
-static int hash_meets_target_be(const uint8_t hash_be[32], const uint8_t target_be[32]) {
-    for (int i = 0; i < 32; i++) {
-        if (hash_be[i] < target_be[i]) return 1; // Hash kleiner -> erfüllt Target
-        if (hash_be[i] > target_be[i]) return 0; // Hash größer  -> nicht erfüllt
-    }
-    return 1; // exakt gleich
+// (nur Anzeige) Target -> approx Diff
+static double target_to_diff(const uint8_t target_be[32]) {
+    BN_CTX *ctx = BN_CTX_new();
+    BIGNUM *diff1 = BN_bin2bn(DIFF1_TARGET_BE, 32, NULL);
+    BIGNUM *tgt   = BN_bin2bn(target_be, 32, NULL);
+    BIGNUM *q     = BN_new();
+
+    if (BN_is_zero(tgt)) { BN_free(diff1); BN_free(tgt); BN_free(q); BN_CTX_free(ctx); return 0.0; }
+    BN_div(q, NULL, diff1, tgt, ctx);
+
+    int n = BN_num_bytes(q);
+    unsigned char buf[64] = {0};
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    BN_bn2binpad(q, buf, n);
+#else
+    BN_bn2bin(q, buf + (64 - n));
+#endif
+    int off = (n >= 8) ? (n - 8) : 0;
+    uint64_t top = 0; for (int i=0;i<8 && (off+i)<n;i++) top = (top<<8) | buf[off+i];
+    int rem = n - 8; double d = (double)top; while (rem-- > 0) d *= 256.0;
+
+    BN_free(diff1); BN_free(tgt); BN_free(q); BN_CTX_free(ctx);
+    return d;
 }
 
+// Hash (BE) <= Target (BE)?
+static int hash_meets_target_be(const uint8_t hash_be[32], const uint8_t target_be[32]) {
+    for (int i = 0; i < 32; i++) {
+        if (hash_be[i] < target_be[i]) return 1;
+        if (hash_be[i] > target_be[i]) return 0;
+    }
+    return 1;
+}
 
-// ============================ Stratum ==============================
-typedef struct {
-    char host[256];
-    int  port;
-    int  sock;
-    char wallet[256];
-    char pass[512];
-    char extranonce1[64];
-    cl_uint extranonce2_size;
-} stratum_ctx_t;
+// ============================ Stratum helpers ==============================
+
+// Subscribe parsing helper (advance pointer) – genau 1x definieren!
+static int next_quoted(const char **pp, const char *end, char *out, size_t cap) {
+    const char *p = *pp, *q1 = NULL, *q2 = NULL;
+    for (; p < end; p++) if (*p == '"') { q1 = p; break; }
+    if (!q1) return 0;
+    for (p = q1 + 1; p < end; p++) if (*p == '"') { q2 = p; break; }
+    if (!q2) return 0;
+    size_t L = (size_t)(q2 - (q1 + 1)); if (L >= cap) L = cap - 1;
+    memcpy(out, q1 + 1, L); out[L] = 0;
+    *pp = q2 + 1;
+    return 1;
+}
 
 typedef struct {
     char     job_id[128];
@@ -231,13 +253,126 @@ typedef struct {
     int      clean;
 } stratum_job_t;
 
+// Parse "mining.notify" into stratum_job_t (exactly once, no duplicates!)
+static int stratum_parse_notify(const char *line, stratum_job_t *J){
+    if (!strstr(line,"\"mining.notify\"")) return 0;
+
+    memset(J,0,sizeof *J);
+
+    const char *pp = strstr(line,"\"params\"");
+    if(!pp) return 0;
+    const char *lb = strchr(pp,'[');
+    const char *rb = lb ? strrchr(pp,']') : NULL;
+    if(!lb || !rb || rb <= lb) return 0;
+
+    const char *p = lb + 1;
+
+    // 1) job_id, 2) prevhash, 3) coinb1, 4) coinb2
+    if(!next_quoted(&p,rb,J->job_id,     sizeof J->job_id))     return 0;
+    if(!next_quoted(&p,rb,J->prevhash_hex,sizeof J->prevhash_hex)) return 0;
+    if(!next_quoted(&p,rb,J->coinb1_hex, sizeof J->coinb1_hex)) return 0;
+    if(!next_quoted(&p,rb,J->coinb2_hex, sizeof J->coinb2_hex)) return 0;
+
+    // 5) merkle array
+    J->merkle_count = 0;
+    const char *m_lb = strchr(p,'['), *m_rb = NULL;
+    if (m_lb) {
+        int depth = 0; const char *scan = m_lb;
+        for (; scan < rb; scan++){
+            if (*scan == '[') depth++;
+            else if (*scan == ']') {
+                depth--;
+                if (depth == 0){ m_rb = scan; break; }
+            }
+        }
+    }
+    if (m_lb && m_rb && m_rb > m_lb) {
+        const char *mp = m_lb + 1;
+        while (J->merkle_count < 16) {
+            char tmp[65];
+            if (!next_quoted(&mp, m_rb, tmp, sizeof tmp)) break;
+            snprintf(J->merkle_hex[J->merkle_count], 65, "%s", tmp);
+            J->merkle_count++;
+        }
+        p = m_rb + 1;
+    }
+
+    // 6) version, nbits, ntime (hex strings)
+    char vhex[16]={0}, nbhex[16]={0}, nth[16]={0};
+    if(!next_quoted(&p,rb,vhex,sizeof vhex)) return 0;  sscanf(vhex, "%x", &J->version);
+    if(!next_quoted(&p,rb,nbhex,sizeof nbhex)) return 0; sscanf(nbhex,"%x", &J->nbits);
+    if(!next_quoted(&p,rb,nth,sizeof nth))     return 0;  sscanf(nth,  "%x", &J->ntime);
+
+    // 7) clean flag
+    J->clean = strstr(p,"true") != NULL;
+    return 1;
+}
+
+
+// mining.set_difficulty (Fallback)
+static int parse_set_difficulty_line(const char *line, double *out_diff) {
+    const char *p = strstr(line, "mining.set_difficulty");
+    if (!p) return 0;
+    p = strstr(p, "\"params\""); if (!p) return 0;
+    p = strchr(p, '['); if (!p) return 0; p++;
+    while (*p==' '||*p=='\t') p++;
+    char *endp=NULL;
+    double d = strtod(p, &endp);
+    if (endp == p) return 0;
+    *out_diff = d;
+    return 1;
+}
+
+// mining.set_target – 32B big-endian Hex direkt übernehmen
+static int parse_set_target_line(const char *line, uint8_t out_be[32]) {
+    const char *p = strstr(line, "mining.set_target");
+    if (!p) return 0;
+    const char *pp = strstr(p, "\"params\""); if (!pp) return 0;
+    const char *lb = strchr(pp, '['); const char *rb = lb ? strchr(lb, ']') : NULL;
+    if (!lb || !rb || rb <= lb) return 0;
+    char thex[130] = {0};
+    const char *scan = lb + 1;
+    if (!next_quoted(&scan, rb, thex, sizeof thex)) return 0;
+    if (!hex2bin(thex, out_be, 32)) return 0;    // 64 Hex-Zeichen -> 32 Byte BE
+    return 1;
+}
+
+static int parse_diff_from_pass(const char *pass, double *out_diff, int *out_locked) {
+    if (!pass || !*pass) return 0;
+    const char *p = pass;
+    double found = 0.0; int have = 0; int locked = 0;
+    while (*p) {
+        while (*p == ' ' || *p == ',' || *p == ';') p++;
+        if (!*p) break;
+        const char *k = p;
+        while (*p && *p != ',' && *p != ';') p++;
+        size_t L = (size_t)(p - k);
+        if (L >= 2 && !strncmp(k,"d=",2)) { found = strtod(k+2, NULL); have=1; locked=1; }
+        else if (L >= 3 && !strncmp(k,"sd=",3)) { if (!locked) { found = strtod(k+3, NULL); have=1; } }
+    }
+    if (have && found > 0.0) { *out_diff = found; *out_locked = locked; return 1; }
+    return 0;
+}
+
+// ============================ Stratum core ==============================
+typedef struct {
+    char host[256];
+    int  port;
+    int  sock;
+    char wallet[256];
+    char pass[512];
+    char extranonce1[64];
+    cl_uint extranonce2_size;
+} stratum_ctx_t;
+
+
+
 static int set_nonblock(int s, int on) {
     int flags = fcntl(s, F_GETFL, 0);
     if (flags < 0) return -1;
     if (on) flags |= O_NONBLOCK; else flags &= ~O_NONBLOCK;
     return fcntl(s, F_SETFL, flags);
 }
-
 static int is_numeric_ip(const char *s) {
     struct in6_addr a6; struct in_addr a4;
     return inet_pton(AF_INET, s, &a4) == 1 || inet_pton(AF_INET6, s, &a6) == 1;
@@ -268,15 +403,9 @@ static int sock_connect_verbose(const char *host, int port, int timeout_ms) {
     struct addrinfo hints = {0}, *res=NULL, *p=NULL;
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_flags    = AI_NUMERICSERV | AI_ADDRCONFIG;
-
+    hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC; hints.ai_flags = AI_NUMERICSERV | AI_ADDRCONFIG;
     int ga = getaddrinfo(host, portstr, &hints, &res);
-    if (ga != 0 || !res) {
-        fprintf(stderr, "DNS resolve failed for %s:%s - %s\n", host, portstr, gai_strerror(ga));
-        return -1;
-    }
+    if (ga != 0 || !res) { fprintf(stderr, "DNS resolve failed for %s:%s - %s\n", host, portstr, gai_strerror(ga)); return -1; }
 
     int s = -1;
     for (p = res; p; p = p->ai_next) {
@@ -293,10 +422,13 @@ static int sock_connect_verbose(const char *host, int port, int timeout_ms) {
         if (getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0 || soerr != 0) { close(s); s=-1; continue; }
         break;
     }
-
     freeaddrinfo(res);
     return s;
 }
+
+// send/recv buffer (genau 1x)
+static char inbuf[65536];
+static size_t inlen = 0;
 
 static int send_line_verbose(int s, const char *line) {
     size_t L = strlen(line), o = 0;
@@ -311,11 +443,6 @@ static int send_line_verbose(int s, const char *line) {
     }
     return 1;
 }
-
-// Line buffer
-static char inbuf[65536];
-static size_t inlen = 0;
-
 static int recv_into_buffer(int s, int timeout_ms) {
     fd_set rfds; struct timeval tv;
     FD_ZERO(&rfds); FD_SET(s, &rfds);
@@ -329,7 +456,6 @@ static int recv_into_buffer(int s, int timeout_ms) {
     memcpy(inbuf + inlen, tmp, (size_t)n); inlen += (size_t)n;
     return 1;
 }
-
 static int next_line(char *out, size_t cap) {
     for (size_t i=0;i<inlen;i++) if (inbuf[i]=='\n') {
         size_t L = i+1; if (L >= cap) L = cap-1;
@@ -341,33 +467,7 @@ static int next_line(char *out, size_t cap) {
     return 0;
 }
 
-// Subscribe parsing helper (advance pointer)
-static int next_quoted(const char **pp, const char *end, char *out, size_t cap) {
-    const char *p = *pp, *q1 = NULL, *q2 = NULL;
-    for (; p < end; p++) if (*p == '"') { q1 = p; break; }
-    if (!q1) return 0;
-    for (p = q1 + 1; p < end; p++) if (*p == '"') { q2 = p; break; }
-    if (!q2) return 0;
-    size_t L = (size_t)(q2 - (q1 + 1)); if (L >= cap) L = cap - 1;
-    memcpy(out, q1 + 1, L); out[L] = 0;
-    *pp = q2 + 1;
-    return 1;
-}
-
-static const char* find_after_result_array_first(const char *s) {
-    const char *p = strstr(s, "\"result\""); if (!p) return NULL;
-    p = strchr(p, '['); if (!p) return NULL;
-    int depth = 0; int first_closed = 0;
-    for (; *p; p++){
-        if (*p == '[') depth++;
-        else if (*p == ']') {
-            depth--;
-            if (depth == 1 && !first_closed) { first_closed = 1; return p+1; }
-        }
-    }
-    return NULL;
-}
-
+// subscribe result parser
 static int parse_subscribe_result(const char *line, char *ex1, size_t ex1cap, cl_uint *ex2sz){
     if (!strstr(line, "\"id\":1") || !strstr(line, "\"result\"")) return 0;
     const char *p = strstr(line, "\"result\""); if(!p) return 0;
@@ -380,7 +480,7 @@ static int parse_subscribe_result(const char *line, char *ex1, size_t ex1cap, cl
         p++;
     }
     if (depth != 0) return 0;
-    while (*p == ' ' || *p == '	' || *p == ',') p++;
+    while (*p == ' ' || *p == '\t' || *p == ',') p++;
     if (*p != '"') return 0;
     const char *q1 = ++p;
     while (*p && *p != '"') p++;
@@ -388,7 +488,7 @@ static int parse_subscribe_result(const char *line, char *ex1, size_t ex1cap, cl
     size_t L = (size_t)(p - q1); if (L >= ex1cap) L = ex1cap - 1;
     memcpy(ex1, q1, L); ex1[L] = 0;
     p++;
-    while (*p == ' ' || *p == '	' || *p == ',') p++;
+    while (*p == ' ' || *p == '\t' || *p == ',') p++;
     if (!(*p == '-' || (*p >= '0' && *p <= '9'))) return 0;
     unsigned long v = strtoul(p, NULL, 10);
     if (v == 0 || v > 32) v = 4;
@@ -396,46 +496,8 @@ static int parse_subscribe_result(const char *line, char *ex1, size_t ex1cap, cl
     return 1;
 }
 
-static int parse_set_difficulty_line(const char *line, double *out_diff) {
-    const char *p = strstr(line, "mining.set_difficulty");
-    if (!p) return 0;
-    p = strstr(p, "\"params\"");
-    if (!p) return 0;
-    p = strchr(p, '[');
-    if (!p) return 0;
-    p++;
-    while (*p==' '||*p=='\t') p++;
-    char *endp=NULL;
-    double d = strtod(p, &endp);
-    if (endp == p) return 0;
-    *out_diff = d;
-    return 1;
-}
 
-static int parse_diff_from_pass(const char *pass, double *out_diff, int *out_locked) {
-    if (!pass || !*pass) return 0;
-    const char *p = pass;
-    double found = 0.0; int have = 0; int locked = 0;
-    while (*p) {
-        while (*p == ' ' || *p == ',' || *p == ';') p++;
-        if (!*p) break;
-        const char *k = p;
-        while (*p && *p != ',' && *p != ';') p++;
-        size_t L = (size_t)(p - k);
-        if (L >= 2 && !strncmp(k,"d=",2)) {
-            found = strtod(k+2, NULL); have=1; locked=1;
-        } else if (L >= 3 && !strncmp(k,"sd=",3)) {
-            if (!locked) { found = strtod(k+3, NULL); have=1; }
-        }
-    }
-    if (have && found > 0.0) {
-        *out_diff = found;
-        *out_locked = locked;
-        return 1;
-    }
-    return 0;
-}
-
+// Stratum connect + subscribe + authorize, inkl. set_target / set_difficulty
 static int stratum_connect_one(stratum_ctx_t *C,const char *host,int port,const char *user,const char *pass){
     memset(C,0,sizeof *C);
     snprintf(C->host,sizeof C->host,"%s",host); C->port=port;
@@ -444,48 +506,61 @@ static int stratum_connect_one(stratum_ctx_t *C,const char *host,int port,const 
 
     C->sock = sock_connect_verbose(host, port, 5000);
     if (C->sock < 0) return 0;
+    int one = 1; setsockopt(C->sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
+    // subscribe
     char sub[256];
     snprintf(sub,sizeof sub,"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"cpuminer-opt/3.21.0\"]}\n");
     if(!send_line_verbose(C->sock,sub)) { fprintf(stderr,"Stratum send subscribe failed\n"); close(C->sock); return 0; }
 
-    time_t t0=time(NULL); char line[16384];
-    int have_ex = 0;
-    while (time(NULL)-t0 < 5) {
+    // wait for subscribe + optional target/diff
+    time_t t0=time(NULL); char line[16384]; int have_ex = 0;
+    while (time(NULL) - t0 < 5) {
         recv_into_buffer(C->sock, 500);
-        while (next_line(line,sizeof line)) {
-            if (strstr(line,"\"result\"") && !strstr(line,"\"method\"")) {
+        while (next_line(line, sizeof line)) {
+            // subscribe result
+            if (!have_ex && strstr(line,"\"result\"") && !strstr(line,"\"method\"")) {
                 if (parse_subscribe_result(line, C->extranonce1, sizeof C->extranonce1, &C->extranonce2_size)) {
-                    have_ex = 1; break;
+                    have_ex = 1;
+                    continue;
                 }
             }
+            // set_target
+            uint8_t t_be[32];
+            if (parse_set_target_line(line, t_be)) {
+                memcpy(g_share_target_be, t_be, 32);
+                if (!g_diff_locked) g_share_diff = target_to_diff(g_share_target_be);
+                if (g_debug) printf("[TARGET] set_target; approx diff=%.8f\n", g_share_diff);
+                continue;
+            }
+            // set_difficulty
             double dtmp;
             if (!g_diff_locked && parse_set_difficulty_line(line, &dtmp)) {
                 g_share_diff = dtmp;
                 diff_to_target(g_share_diff, g_share_target_be);
-                if (g_debug) {
-                    printf("[DIFF] set_difficulty=%.8f\n", g_share_diff);
-                }
+                if (g_debug) printf("[DIFF] set_difficulty=%.8f\n", g_share_diff);
+                continue;
             }
+            // notify vor authorize ignorieren
         }
         if (have_ex) break;
     }
-    if (!have_ex) {
-        fprintf(stderr, "No subscribe result within timeout (5s)\n");
-        close(C->sock); return 0;
-    }
-    if (!C->extranonce1[0]) snprintf(C->extranonce1,sizeof C->extranonce1,"00000000");
+    if (!have_ex) { fprintf(stderr, "No subscribe result within timeout (5s)\n"); close(C->sock); return 0; }
+
+    if (!C->extranonce1[0]) snprintf(C->extranonce1, sizeof C->extranonce1, "00000000");
     if (!C->extranonce2_size) C->extranonce2_size = 4;
 
+    // authorize
     char auth[1536];
     int nw = snprintf(auth,sizeof auth,"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}\n",C->wallet,C->pass);
     if (nw <= 0 || (size_t)nw >= sizeof auth) { fprintf(stderr,"authorize snprintf overflow\n"); close(C->sock); return 0; }
     if(!send_line_verbose(C->sock,auth)) { fprintf(stderr,"Stratum send authorize failed\n"); close(C->sock); return 0; }
 
+    // kleine Drainage
     time_t t1=time(NULL);
     while (time(NULL)-t1 < 2) { recv_into_buffer(C->sock, 200); char dump[16384]; while(next_line(dump,sizeof dump)){} }
 
-    printf("Connected. extranonce1=%s ex2_size=%u  (Batch=%u)\n", C->extranonce1, (unsigned)C->extranonce2_size, (unsigned)BATCH_DEFAULT);
+    printf("Connected. extranonce1=%s ex2_size=%u\n", C->extranonce1, (unsigned)C->extranonce2_size);
     return 1;
 }
 
@@ -503,51 +578,7 @@ static int stratum_connect_any(stratum_ctx_t *C, const char **hosts, int port, c
     return 0;
 }
 
-static int stratum_parse_notify(const char *line, stratum_job_t *J){
-    if (!strstr(line,"\"mining.notify\"")) return 0;
-    memset(J,0,sizeof *J);
-    const char *pp = strstr(line,"\"params\""); if(!pp) return 0;
-    const char *lb = strchr(pp,'['); const char *rb = lb?strrchr(pp,']'):NULL;
-    if(!lb||!rb||rb<=lb) return 0;
-    const char *p = lb+1;
-
-    if(!next_quoted(&p,rb,J->job_id,sizeof J->job_id)) return 0;
-    if(!next_quoted(&p,rb,J->prevhash_hex,sizeof J->prevhash_hex)) return 0;
-    if(!next_quoted(&p,rb,J->coinb1_hex,sizeof J->coinb1_hex)) return 0;
-    if(!next_quoted(&p,rb,J->coinb2_hex,sizeof J->coinb2_hex)) return 0;
-
-    J->merkle_count = 0;
-    // Parse merkle array
-    const char *m_lb=strchr(p,'['), *m_rb=NULL;
-    if (m_lb) {
-        int depth=0;
-        const char *scan=m_lb;
-        for (; scan<rb; scan++){
-            if (*scan=='[') depth++;
-            else if (*scan==']') { depth--; if (depth==0){ m_rb=scan; break; } }
-        }
-    }
-    if (m_lb && m_rb && m_rb>m_lb) {
-        const char *mp = m_lb+1;
-        while (J->merkle_count < 16) {
-            char tmp[65];
-            if(!next_quoted(&mp, m_rb, tmp, sizeof tmp)) break;
-            snprintf(J->merkle_hex[J->merkle_count],65,"%s",tmp);
-            J->merkle_count++;
-        }
-        p = m_rb+1;
-    }
-
-    char vhex[16]={0}, nbhex[16]={0}, nth[16]={0};
-    if(!next_quoted(&p,rb,vhex,sizeof vhex)) return 0; sscanf(vhex,"%x",&J->version);
-    if(!next_quoted(&p,rb,nbhex,sizeof nbhex)) return 0; sscanf(nbhex,"%x",&J->nbits);
-    if(!next_quoted(&p,rb,nth,sizeof nth))     return 0; sscanf(nth,"%x",&J->ntime);
-
-    J->clean = strstr(p,"true")!=NULL;
-    return 1;
-}
-
-// Stratum will 8-stellige Hex-ZAHLEN für ntime/nonce (wie cpuminer), nicht LE-Byte-Hex.
+// mining.submit JSON – %08x für ntime/nonce (nicht LE-Byteketten!)
 static size_t build_submit_json(char *req, size_t cap,
                                 const char *wallet, const char *job_id,
                                 const char *ex2_hex, uint32_t ntime_le, uint32_t nonce_le)
@@ -559,36 +590,29 @@ static size_t build_submit_json(char *req, size_t cap,
     );
 }
 
-// Immer die Pool-Antwort zeigen, inkl. REJECT-Grund (JSON)
+// Immer Pool-Antwort (ACCEPT/REJECT) ausgeben; ID=4 gehört zum letzten Submit
 static void stratum_wait_submit_ack(int sock) {
     char line[4096];
     uint64_t start = mono_ms();
-
     while (mono_ms() - start <= 5000) {
         recv_into_buffer(sock, 250);
-
         while (next_line(line, sizeof line)) {
             if (strstr(line, "\"id\":4")) {
-                if (strstr(line, "\"result\":true")) {
-                    g_accepted_shares++;
-                    fprintf(stderr, " -> ACCEPTED\n");
-                    fflush(stdout);
-                    return;
-                }
-                if (strstr(line, "\"error\"")) {
-                    g_rejected_shares++;
-                    fprintf(stderr, "[REJECT] %s", line);
-                    fprintf(stderr, " -> REJECTED\n");
-                    fflush(stdout);
-                    return;
-                }
+                if (strstr(line, "\"result\":true")) { g_accepted_shares++; fprintf(stderr, " -> ACCEPTED\n"); fflush(stdout); return; }
+                if (strstr(line, "\"error\""))       { g_rejected_shares++; fprintf(stderr, "[REJECT] %s", line); fprintf(stderr, " -> REJECTED\n"); fflush(stdout); return; }
             }
-            // nebenbei reinkommende diff ggf. übernehmen
+            // Nebenbei eintreffende Diff/Target übernehmen (wenn nicht gelockt)
             double dtmp;
             if (!g_diff_locked && parse_set_difficulty_line(line, &dtmp)) {
-                g_share_diff = dtmp;
-                diff_to_target(g_share_diff, g_share_target_be);
+                g_share_diff = dtmp; diff_to_target(g_share_diff, g_share_target_be);
                 if (g_debug) fprintf(stderr, "[DIFF] set_difficulty=%.8f\n", g_share_diff);
+            } else {
+                uint8_t t_be[32];
+                if (!g_diff_locked && parse_set_target_line(line, t_be)) {
+                    memcpy(g_share_target_be, t_be, 32);
+                    g_share_diff = target_to_diff(g_share_target_be);
+                    if (g_debug) fprintf(stderr, "[TARGET] set_target; approx diff=%.8f\n", g_share_diff);
+                }
             }
         }
         usleep(20000);
@@ -606,14 +630,14 @@ static int stratum_submit(stratum_ctx_t *C, const stratum_job_t *J,
     char req[1536];
     size_t n = build_submit_json(req, sizeof req, C->wallet, J->job_id,
                                  extranonce2_hex, ntime_le, nonce_le);
-    if (n == 0 || n >= sizeof req) {
-        fprintf(stderr,"submit snprintf overflow\n");
-        return 0;
-    }
+    if (n == 0 || n >= sizeof req) { fprintf(stderr,"submit snprintf overflow\n"); return 0; }
     int ok = send_line_verbose(C->sock, req);
     if (ok) stratum_wait_submit_ack(C->sock);
     return ok;
 }
+
+// ===== END CLEAN STRATUM HELPERS =================================
+
 
 // Build merkle root from coinbase hash + branches
 static void build_merkle_root_le(const uint8_t cb_be[32], char merkle_hex[][65], int mcount, uint8_t out_le[32]) {
@@ -642,6 +666,8 @@ static void build_header_le(const stratum_job_t *J, const uint8_t prevhash_le[32
 }
 
 // ============================ OpenCL helpers ======================
+
+
 static char* load_kernel_source_try(const char *path) {
     FILE *f=fopen(path,"rb");
     if(!f) return NULL;
@@ -747,10 +773,11 @@ int main(int argc, char **argv) {
     // Parse d= / sd= aus POOL_PASS (Diff & Lock setzen)
     double pdiff = 0.0; int locked = 0;
     if (parse_diff_from_pass(PASS, &pdiff, &locked) && pdiff > 0.0) {
+        if (pdiff < 0.001) pdiff = 0.001;
         g_share_diff = pdiff;
         diff_to_target(g_share_diff, g_share_target_be);
-        g_diff_locked = locked;
-        printf("Password diff: %.8f%s\n", g_share_diff, locked ? " (locked)" : " (start)");
+        g_diff_locked = 0;
+        printf("Password diff: %.8f (start, pool can override)\n", g_share_diff);
     }
 
     const char *force_d_env = getenv("RIN_FORCE_DIFF");
@@ -931,7 +958,6 @@ int main(int argc, char **argv) {
                             prevhash_le[i] = prev_be[31 - i];
                         }
                         nonce_base = 0;
-                        extranonce2_counter = 1;
                         debug_shown_for_job = 0;
 
                         // Job generation and clean job tracking
@@ -956,6 +982,9 @@ int main(int argc, char **argv) {
 
         // Coinbase / Merkle
         stratum_job_t batch_job = J;  // SNAPSHOT
+	uint8_t batch_prevhash_le[32]; 
+        memcpy(batch_prevhash_le, prevhash_le, 32);
+
 
         uint8_t coinb1[4096], coinb2[4096];
         size_t cb1 = strlen(batch_job.coinb1_hex) / 2;
@@ -967,26 +996,19 @@ int main(int argc, char **argv) {
         if (en1b > 64) en1b = 64;
         hex2bin(S.extranonce1, en1, en1b);
 
-        // fresh extranonce2 (mask auf ex2_size)
-        uint32_t en2_mask = (S.extranonce2_size >= 4) ? 0xFFFFFFFFu : ((1u << (S.extranonce2_size * 8)) - 1u);
-        
-        // fresh extranonce2 - NUR beim ersten Chunk eines Jobs
-        static uint32_t current_en2_for_job = 0;
-        if (g_batch_counter == 0) {
-            current_en2_for_job = (extranonce2_counter++) & en2_mask;
-        }
-        uint32_t en2_val = current_en2_for_job;
+        // fresh extranonce2 pro CHUNK (Microbatch)
+        uint32_t en2_val = (extranonce2_counter++) & en2_mask;
 
-        // ---- WICHTIG: en2 BYTES -> coinbase ---- (LE Zählweise wie bisher)
+        // LE-Bytes für coinbase
         uint8_t en2[64] = {0};
         for (int i = 0; i < (int)S.extranonce2_size && i < 4; i++)
             en2[i] = (uint8_t)((en2_val >> (8 * i)) & 0xFF);
 
-        // en2_hex GENAU aus diesen Bytes (gleiche Reihenfolge wie in coinbase!)
+        // ex2_hex GENAU aus diesen Bytes (gleiche Reihenfolge wie in coinbase!)
         char en2_hex[64] = {0};
-        for (cl_uint i = 0; i < S.extranonce2_size; i++) {
+        for (cl_uint i = 0; i < S.extranonce2_size; i++)
             snprintf(en2_hex + i*2, sizeof en2_hex - i*2, "%02x", en2[i]);
-        }
+        
 
         // coinbase = coinb1 | en1 | en2 | coinb2
         uint8_t coinbase[8192]; size_t off = 0;
@@ -1003,7 +1025,16 @@ int main(int argc, char **argv) {
         build_merkle_root_le(cbh_be, batch_job.merkle_hex, batch_job.merkle_count, merkleroot_le);
 
         // Time rolling aus SNAPSHOT
-        uint32_t submit_ntime = batch_job.ntime + (g_batch_counter % 15);
+	// Per Env steuerbar (RIN_NROLL=0..15), Default 0 = AUS (viele Pools sind streng)
+	static int nroll = -1;
+	if (nroll < 0) {
+    	    const char *env = getenv("RIN_NROLL");
+    	    int m = env ? atoi(env) : 0;
+    	    if (m < 0) m = 0; if (m > 15) m = 15;
+    	    nroll = m;
+	}
+	uint32_t submit_ntime = batch_job.ntime + (nroll ? (g_batch_counter % (uint32_t)nroll) : 0);
+
 
         // -------- Prehash (BLAKE3) nur für workN = chunk --------
         cl_uint workN = chunk;
@@ -1011,8 +1042,9 @@ int main(int argc, char **argv) {
         for (cl_uint i = 0; i < workN; i++) {
             uint32_t nonce = nonce_base + i;
             uint8_t header[80];
-            build_header_le(&batch_job, prevhash_le, merkleroot_le,
-                            submit_ntime, batch_job.nbits, nonce, header);
+            build_header_le(&batch_job, batch_prevhash_le, merkleroot_le,
+                	    submit_ntime, batch_job.nbits, nonce, header);
+
             blake3_hash32(header, 80, &h_prehash[i * 32]);
         }
         nonce_base += workN;
